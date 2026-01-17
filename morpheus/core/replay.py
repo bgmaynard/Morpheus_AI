@@ -8,6 +8,15 @@ Given a sequence of events, replay must rebuild:
 - Last risk locks / drawdown status
 
 Determinism: Same event list => same reconstructed state.
+
+IMPORTANT: Replay validates all transitions via FSM logic.
+---------------------------------------------------------
+Replay does NOT blindly set state from event payloads.
+Instead, it re-applies transitions through the FSM, which validates
+that each transition is legal. If the event stream contains an
+impossible transition, replay will FAIL LOUDLY with a ReplayValidationError.
+
+This prevents corrupted logs from silently rebuilding invalid state.
 """
 
 from __future__ import annotations
@@ -19,7 +28,36 @@ from typing import Iterator
 
 from morpheus.core.events import Event, EventType
 from morpheus.core.event_sink import EventSink
-from morpheus.core.trade_fsm import TradeLifecycleFSM, TradeRecord, TradeState
+from morpheus.core.trade_fsm import (
+    TradeLifecycleFSM,
+    TradeRecord,
+    TradeState,
+    InvalidTransitionError,
+)
+
+
+class ReplayValidationError(Exception):
+    """
+    Raised when replay encounters an invalid state transition in the event stream.
+
+    This indicates either:
+    - Corrupted event logs
+    - A bug in the system that produced the events
+    - Events from an incompatible version
+
+    The error includes the event that caused the failure and the underlying
+    InvalidTransitionError from the FSM.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        event: Event,
+        cause: InvalidTransitionError | None = None,
+    ):
+        self.event = event
+        self.cause = cause
+        super().__init__(message)
 
 
 @dataclass
@@ -101,10 +139,26 @@ class EventReplayer:
         return state
 
     def _process_event(self, state: ReplayState, event: Event) -> None:
-        """Process a single event and update state."""
+        """
+        Process a single event and update state.
+
+        Raises ReplayValidationError if the event contains an invalid transition.
+        This ensures replay fails loudly on corrupted data rather than
+        silently building invalid state.
+        """
         handler = self._handlers.get(event.event_type)
         if handler:
-            handler(state, event)
+            try:
+                handler(state, event)
+            except InvalidTransitionError as e:
+                raise ReplayValidationError(
+                    f"Invalid state transition in event stream: {e}. "
+                    f"Event {event.event_id} attempted transition "
+                    f"{e.current_state.value} -> {e.attempted_state.value} "
+                    f"for trade {e.trade_id}",
+                    event=event,
+                    cause=e,
+                ) from e
 
         state.events_processed += 1
         state.last_event_timestamp = event.timestamp

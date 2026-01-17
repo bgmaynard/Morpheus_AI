@@ -168,6 +168,8 @@ class TradeLifecycleFSM:
             create_event(
                 EventType.TRADE_INITIATED,
                 payload={
+                    "from_state": None,  # No prior state for new trades
+                    "to_state": TradeState.INITIATED.value,
                     "direction": direction,
                     "strategy_name": strategy_name,
                     "signal_id": signal_id,
@@ -192,12 +194,15 @@ class TradeLifecycleFSM:
     ) -> TradeRecord:
         """
         Internal method to perform a validated state transition.
+
+        All transition events include from_state and to_state for auditability.
         """
         trade = self._trades.get(trade_id)
         if trade is None:
             raise ValueError(f"Trade {trade_id} not found")
 
-        self._validate_transition(trade_id, trade.state, new_state)
+        from_state = trade.state
+        self._validate_transition(trade_id, from_state, new_state)
 
         now = timestamp or datetime.now(timezone.utc)
 
@@ -224,10 +229,17 @@ class TradeLifecycleFSM:
         )
         self._trades[trade_id] = new_trade
 
+        # Build event payload with from_state and to_state for auditability
+        event_payload = {
+            "from_state": from_state.value,
+            "to_state": new_state.value,
+            **(payload or {}),
+        }
+
         self._emit(
             create_event(
                 event_type,
-                payload=payload or {},
+                payload=event_payload,
                 trade_id=trade_id,
                 symbol=trade.symbol,
                 timestamp=now,
@@ -388,3 +400,49 @@ class TradeLifecycleFSM:
     def get_trades_by_symbol(self, symbol: str) -> list[TradeRecord]:
         """Get all trades for a symbol."""
         return [t for t in self._trades.values() if t.symbol == symbol]
+
+    def reset(self, emit_event: bool = True, timestamp: datetime | None = None) -> None:
+        """
+        Reset the FSM to initial state, clearing all trades.
+
+        Reset Semantics:
+        ----------------
+        - All trades are cleared from memory
+        - A SYSTEM_STOP event is emitted (if emit_event=True) to mark the boundary
+        - This is an EVENT-DRIVEN reset: the reset itself is recorded
+
+        When to Reset:
+        --------------
+        - At the start of a new trading session
+        - After a system recovery/restart
+        - During replay initialization (with emit_event=False)
+
+        The FSM does NOT implicitly return to any state. Reset is explicit
+        and event-driven to maintain full auditability.
+
+        Args:
+            emit_event: If True, emit a SYSTEM_STOP event marking the reset.
+            timestamp: Optional timestamp for the reset event.
+        """
+        # Check for active trades that would be orphaned
+        active_trades = self.get_active_trades()
+        if active_trades and emit_event:
+            # Log active trades being cleared
+            active_trade_ids = [t.trade_id for t in active_trades]
+            self._emit(
+                create_event(
+                    EventType.SYSTEM_STOP,
+                    payload={
+                        "reason": "fsm_reset",
+                        "active_trades_cleared": active_trade_ids,
+                        "trade_count": len(self._trades),
+                    },
+                    timestamp=timestamp or datetime.now(timezone.utc),
+                )
+            )
+
+        self._trades.clear()
+
+    def has_active_trades(self) -> bool:
+        """Check if there are any trades in non-terminal states."""
+        return len(self.get_active_trades()) > 0

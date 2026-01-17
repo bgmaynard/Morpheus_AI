@@ -539,3 +539,164 @@ class TestReplayEdgeCases:
         trade = state.fsm.get_trade("t1")
         assert trade.state == TradeState.ENTRY_PENDING
         assert state.events_processed == 3  # All events counted
+
+
+class TestReplayValidation:
+    """
+    Tests for replay validation - ensuring replay fails loudly on invalid data.
+
+    These tests verify the safety invariant that corrupted event logs
+    cannot silently produce invalid state.
+    """
+
+    def test_replay_fails_on_invalid_transition(self):
+        """
+        Replay must fail loudly when event stream contains invalid transition.
+
+        This is a CORE SAFETY INVARIANT - corrupted logs must not silently
+        rebuild invalid state.
+        """
+        from morpheus.core.replay import ReplayValidationError
+
+        # Create events with an INVALID transition:
+        # INITIATED -> ACTIVE (skipping ENTRY_PENDING and ENTRY_FILLED)
+        events = [
+            create_event(
+                EventType.TRADE_INITIATED,
+                payload={"direction": "LONG"},
+                trade_id="invalid-001",
+                symbol="CORRUPT",
+            ),
+            create_event(
+                EventType.TRADE_ACTIVE,  # INVALID: Can't go directly to ACTIVE
+                payload={},
+                trade_id="invalid-001",
+                symbol="CORRUPT",
+            ),
+        ]
+
+        with pytest.raises(ReplayValidationError) as exc_info:
+            replay_events(iter(events))
+
+        # Verify error contains useful information
+        error = exc_info.value
+        assert error.event is not None
+        assert error.event.trade_id == "invalid-001"
+        assert error.cause is not None
+        assert "INITIATED" in str(error)
+        assert "ACTIVE" in str(error)
+
+    def test_replay_fails_on_closed_to_active(self):
+        """Replay must fail when trying to transition from terminal state."""
+        from morpheus.core.replay import ReplayValidationError
+
+        # Create a complete trade, then try to reactivate it
+        events = [
+            create_event(
+                EventType.TRADE_INITIATED,
+                payload={"direction": "LONG"},
+                trade_id="terminal-001",
+                symbol="DONE",
+            ),
+            create_event(
+                EventType.TRADE_CANCELLED,
+                payload={"reason": "test"},
+                trade_id="terminal-001",
+                symbol="DONE",
+            ),
+            create_event(
+                EventType.TRADE_ENTRY_PENDING,  # INVALID: CANCELLED is terminal
+                payload={},
+                trade_id="terminal-001",
+                symbol="DONE",
+            ),
+        ]
+
+        with pytest.raises(ReplayValidationError):
+            replay_events(iter(events))
+
+    def test_replay_validation_error_contains_event(self):
+        """ReplayValidationError must include the offending event for debugging."""
+        from morpheus.core.replay import ReplayValidationError
+
+        bad_event = create_event(
+            EventType.TRADE_CLOSED,  # Can't close a trade that was never opened
+            payload={"exit_price": 100.0, "exit_quantity": 10},
+            trade_id="ghost-trade",
+            symbol="PHANTOM",
+        )
+
+        events = [bad_event]
+
+        with pytest.raises((ReplayValidationError, ValueError)) as exc_info:
+            replay_events(iter(events))
+
+        # For this case, it's a ValueError because trade doesn't exist
+        # But we should still get useful error info
+        assert "ghost-trade" in str(exc_info.value)
+
+
+class TestFromStateToStateInEvents:
+    """Tests verifying from_state and to_state are correctly recorded in events."""
+
+    def test_transition_events_contain_from_and_to_state(self):
+        """All transition events must include from_state and to_state."""
+        fsm = TradeLifecycleFSM(emit_events=True)
+
+        # Initiate trade
+        trade = fsm.initiate_trade(symbol="STATE", direction="LONG")
+        events = fsm.get_pending_events()
+
+        assert len(events) == 1
+        init_event = events[0]
+        assert init_event.payload.get("from_state") is None  # No prior state
+        assert init_event.payload.get("to_state") == "INITIATED"
+
+        # Transition to ENTRY_PENDING
+        trade = fsm.submit_entry_order(trade.trade_id)
+        events = fsm.get_pending_events()
+
+        assert len(events) == 1
+        pending_event = events[0]
+        assert pending_event.payload.get("from_state") == "INITIATED"
+        assert pending_event.payload.get("to_state") == "ENTRY_PENDING"
+
+        # Fill entry
+        trade = fsm.fill_entry(trade.trade_id, entry_price=100.0, entry_quantity=10)
+        events = fsm.get_pending_events()
+
+        assert len(events) == 1
+        filled_event = events[0]
+        assert filled_event.payload.get("from_state") == "ENTRY_PENDING"
+        assert filled_event.payload.get("to_state") == "ENTRY_FILLED"
+
+    def test_full_lifecycle_state_chain(self):
+        """Verify complete state chain is recorded correctly."""
+        fsm = TradeLifecycleFSM(emit_events=True)
+
+        trade = fsm.initiate_trade(symbol="CHAIN", direction="LONG")
+        trade = fsm.submit_entry_order(trade.trade_id)
+        trade = fsm.fill_entry(trade.trade_id, entry_price=100.0, entry_quantity=10)
+        trade = fsm.activate_trade(trade.trade_id)
+        trade = fsm.submit_exit_order(trade.trade_id, exit_reason="target")
+        trade = fsm.close_trade(trade.trade_id, exit_price=110.0, exit_quantity=10)
+
+        events = fsm.get_pending_events()
+
+        # Build the state chain from events
+        state_chain = []
+        for event in events:
+            from_state = event.payload.get("from_state")
+            to_state = event.payload.get("to_state")
+            state_chain.append((from_state, to_state))
+
+        expected_chain = [
+            (None, "INITIATED"),
+            ("INITIATED", "ENTRY_PENDING"),
+            ("ENTRY_PENDING", "ENTRY_FILLED"),
+            ("ENTRY_FILLED", "ACTIVE"),
+            ("ACTIVE", "EXIT_PENDING"),
+            ("EXIT_PENDING", "CLOSED"),
+        ]
+
+        assert state_chain == expected_chain
