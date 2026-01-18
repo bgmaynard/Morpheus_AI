@@ -43,6 +43,10 @@ env/
 .env.local
 .env.*.local
 
+# OAuth tokens (secrets)
+tokens/
+*_token.json
+
 # Logs
 logs/
 *.log
@@ -63,6 +67,7 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+nul
 
 # Model artifacts
 models/*.pkl

@@ -262,6 +262,8 @@ class SchwabAuth:
         """
         Refresh the access token using the refresh token.
 
+        Uses Basic auth header with base64 encoded credentials.
+
         Args:
             http_client: HTTP client with a post() method (e.g., httpx.Client)
 
@@ -271,9 +273,15 @@ class SchwabAuth:
         Raises:
             SchwabAuthError: If refresh fails
         """
+        import base64
+
         token = self.get_token()
 
         logger.info("Refreshing Schwab access token...")
+
+        # Create Basic auth header with base64 encoded credentials
+        credentials = f"{self.client_id}:{self.client_secret}"
+        encoded_credentials = base64.b64encode(credentials.encode()).decode()
 
         try:
             response = http_client.post(
@@ -281,10 +289,11 @@ class SchwabAuth:
                 data={
                     "grant_type": "refresh_token",
                     "refresh_token": token.refresh_token,
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
                 },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                headers={
+                    "Authorization": f"Basic {encoded_credentials}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
             )
 
             if response.status_code != 200:
@@ -307,6 +316,8 @@ class SchwabAuth:
         """
         Exchange authorization code for tokens (initial OAuth flow).
 
+        Uses Basic auth header with base64 encoded credentials.
+
         Args:
             http_client: HTTP client with a post() method
             auth_code: The authorization code from OAuth callback
@@ -314,7 +325,13 @@ class SchwabAuth:
         Returns:
             TokenData with access and refresh tokens
         """
+        import base64
+
         logger.info("Exchanging authorization code for tokens...")
+
+        # Create Basic auth header with base64 encoded credentials
+        credentials = f"{self.client_id}:{self.client_secret}"
+        encoded_credentials = base64.b64encode(credentials.encode()).decode()
 
         try:
             response = http_client.post(
@@ -323,10 +340,11 @@ class SchwabAuth:
                     "grant_type": "authorization_code",
                     "code": auth_code,
                     "redirect_uri": self.redirect_uri,
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
                 },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                headers={
+                    "Authorization": f"Basic {encoded_credentials}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
             )
 
             if response.status_code != 200:
