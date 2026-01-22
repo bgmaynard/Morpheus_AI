@@ -418,3 +418,74 @@ class SchwabMarketClient:
             )
 
         return results
+
+    def get_movers(
+        self,
+        index: str = "$COMPX",
+        direction: str = "up",
+        change_type: str = "percent",
+    ) -> list[dict]:
+        """
+        Get market movers (top gainers/losers) from Schwab.
+
+        Args:
+            index: Index symbol ($COMPX=NASDAQ, $DJI=Dow, $SPX=S&P500)
+            direction: 'up' for gainers, 'down' for losers
+            change_type: 'percent' for % change, 'value' for $ change
+
+        Returns:
+            List of mover data dictionaries with quote info
+        """
+        # Schwab movers endpoint
+        url = f"{self.BASE_URL}/movers/{index}"
+        params = {
+            "sort": direction.upper(),
+            "frequency": 0,  # Real-time
+        }
+
+        try:
+            response = self.http.get(
+                url,
+                headers=self._get_headers(),
+                params=params,
+            )
+
+            if response.status_code != 200:
+                logger.warning(f"Movers request failed: {response.status_code}")
+                return []
+
+            data = response.json()
+
+            # Schwab returns {"screeners": [...]}
+            movers = data.get("screeners", [])
+
+            logger.debug(f"Fetched {len(movers)} movers from {index}")
+            return movers
+
+        except Exception as e:
+            logger.error(f"Failed to get movers: {e}")
+            return []
+
+    def get_all_movers(self) -> list[dict]:
+        """
+        Get movers from multiple indices (NASDAQ focus for small-caps).
+
+        Returns:
+            Combined list of movers from all indices
+        """
+        all_movers = []
+
+        # NASDAQ is primary for small-cap momentum
+        nasdaq_movers = self.get_movers(index="$COMPX", direction="up")
+        all_movers.extend(nasdaq_movers)
+
+        # Deduplicate by symbol
+        seen = set()
+        unique_movers = []
+        for mover in all_movers:
+            symbol = mover.get("symbol", "")
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                unique_movers.append(mover)
+
+        return unique_movers

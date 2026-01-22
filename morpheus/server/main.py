@@ -71,6 +71,15 @@ except ImportError as e:
     logger.warning(f"Persistence layer not available: {e}")
     PERSISTENCE_AVAILABLE = False
 
+# Scanner imports (optional)
+try:
+    from morpheus.scanner.scanner import Scanner, ScannerConfig, ScanResult
+    from morpheus.scanner.watchlist import Watchlist, WatchlistConfig, WatchlistState
+    SCANNER_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Scanner not available: {e}")
+    SCANNER_AVAILABLE = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -266,9 +275,15 @@ class MorpheusServer:
         self._persistence: PersistenceListener | None = None
         self._persistence_available = False
 
+        # Scanner and watchlist
+        self._scanner: Scanner | None = None
+        self._watchlist: Watchlist | None = None
+        self._scanner_available = False
+
         self._init_market_data()
         self._init_pipeline()
         self._init_persistence()
+        self._init_scanner()
 
     def _init_market_data(self):
         """Initialize Schwab market data client if credentials are available."""
@@ -441,6 +456,127 @@ class MorpheusServer:
         except Exception as e:
             logger.error(f"Failed to initialize persistence: {e}")
             self._persistence_available = False
+
+    def _init_scanner(self):
+        """Initialize the scanner for auto-discovery of candidates."""
+        if not SCANNER_AVAILABLE:
+            logger.warning("Scanner module not available")
+            return
+
+        if not self._market_data_available:
+            logger.warning("Scanner requires market data - disabled")
+            return
+
+        try:
+            # Create scanner config (small-cap momentum focus)
+            scanner_config = ScannerConfig(
+                min_price=1.00,
+                max_price=20.00,
+                min_rvol=2.0,
+                min_change_pct=5.0,
+                max_spread_pct=2.0,
+                scan_interval_seconds=60.0,
+                max_results=15,
+            )
+
+            # Create watchlist config
+            watchlist_config = WatchlistConfig(
+                new_to_active_delay_seconds=30.0,
+                stale_timeout_seconds=300.0,
+                max_watchlist_size=20,
+            )
+
+            # Create fetch function using market client
+            async def fetch_movers():
+                if self._market_client:
+                    return self._market_client.get_all_movers()
+                return []
+
+            # Create scanner with callback
+            self._scanner = Scanner(
+                config=scanner_config,
+                fetch_movers=fetch_movers,
+                on_candidate=self._handle_scanner_candidate,
+            )
+
+            # Create watchlist
+            self._watchlist = Watchlist(
+                config=watchlist_config,
+                on_activated=self._handle_watchlist_activated,
+            )
+
+            self._scanner_available = True
+            logger.info("Scanner initialized (auto-discovery enabled)")
+            logger.info(f"  - Price range: ${scanner_config.min_price}-${scanner_config.max_price}")
+            logger.info(f"  - Min RVOL: {scanner_config.min_rvol}x")
+            logger.info(f"  - Scan interval: {scanner_config.scan_interval_seconds}s")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize scanner: {e}")
+            self._scanner_available = False
+
+    async def _handle_scanner_candidate(self, candidate: ScanResult) -> None:
+        """Handle a new candidate from the scanner."""
+        try:
+            symbol = candidate.symbol
+
+            # Add to watchlist
+            if self._watchlist:
+                entry = await self._watchlist.add(
+                    symbol=symbol,
+                    reason=", ".join(candidate.reasons),
+                    score=candidate.score,
+                    initial_price=candidate.price,
+                    initial_rvol=candidate.rvol,
+                    initial_change_pct=candidate.change_pct,
+                )
+
+                if entry:
+                    logger.info(
+                        f"[SCANNER] Candidate added: {symbol} "
+                        f"${candidate.price:.2f} {candidate.change_pct:+.1f}% "
+                        f"RVOL={candidate.rvol:.1f}x Score={candidate.score:.0f}"
+                    )
+
+            # Emit event for UI
+            await self.emit_event(create_event(
+                EventType.REGIME_DETECTED,  # Reuse for now, or add SCANNER_CANDIDATE
+                symbol=symbol,
+                payload={
+                    "type": "scanner_candidate",
+                    "symbol": symbol,
+                    "price": candidate.price,
+                    "change_pct": candidate.change_pct,
+                    "rvol": candidate.rvol,
+                    "score": candidate.score,
+                    "reasons": candidate.reasons,
+                    "scan_type": candidate.scan_type.value,
+                },
+            ))
+
+        except Exception as e:
+            logger.error(f"Error handling scanner candidate: {e}")
+
+    async def _handle_watchlist_activated(self, entry) -> None:
+        """Handle a watchlist entry becoming ACTIVE - subscribe for data."""
+        try:
+            symbol = entry.symbol
+
+            # Subscribe to streaming quotes
+            self.state.subscribed_symbols.add(symbol)
+            if self._streamer_available and self._use_streaming and self._streamer:
+                await self._streamer.subscribe_quotes([symbol])
+
+            # Add to signal pipeline
+            if self._pipeline_available and self._pipeline:
+                self._pipeline.add_symbol(symbol)
+                # Warmup with historical data
+                asyncio.create_task(self._warmup_pipeline_symbol(symbol))
+
+            logger.info(f"[WATCHLIST] {symbol} activated - subscribed for live data")
+
+        except Exception as e:
+            logger.error(f"Error activating watchlist symbol: {e}")
 
     async def _handle_aggregated_candle(self, symbol: str, ohlcv: OHLCV, timestamp: datetime) -> None:
         """Handle completed 1-min candle from aggregator."""
@@ -754,6 +890,14 @@ class MorpheusServer:
             await self._pipeline.start()
             logger.info("Signal pipeline started (OBSERVATIONAL MODE - no auto-execution)")
 
+        # Start scanner and watchlist
+        if self._scanner_available:
+            if self._watchlist:
+                await self._watchlist.start()
+            if self._scanner:
+                await self._scanner.start()
+            logger.info("Scanner started (auto-discovery enabled)")
+
         # Emit system start event
         await self.emit_event(create_event(
             EventType.SYSTEM_START,
@@ -771,6 +915,12 @@ class MorpheusServer:
 
     async def stop(self):
         """Stop background tasks."""
+        # Stop scanner and watchlist
+        if self._scanner:
+            await self._scanner.stop()
+        if self._watchlist:
+            await self._watchlist.stop()
+
         # Stop signal pipeline
         if self._pipeline_available and self._pipeline:
             await self._pipeline.stop()
@@ -1716,6 +1866,87 @@ def create_app() -> FastAPI:
         except Exception as e:
             logger.error(f"Error getting trade stats: {e}")
             return {"enabled": True, "error": str(e)}
+
+    # ========================================================================
+    # Scanner Routes
+    # ========================================================================
+
+    @app.get("/api/scanner/status")
+    async def get_scanner_status():
+        """Get scanner status and statistics."""
+        if not server._scanner_available:
+            return {"enabled": False, "error": "Scanner not available"}
+
+        scanner_stats = server._scanner.get_stats() if server._scanner else {}
+        watchlist_stats = server._watchlist.get_stats() if server._watchlist else {}
+
+        return {
+            "enabled": True,
+            "scanner": scanner_stats,
+            "watchlist": watchlist_stats,
+        }
+
+    @app.get("/api/scanner/watchlist")
+    async def get_watchlist():
+        """Get current watchlist entries."""
+        if not server._scanner_available or not server._watchlist:
+            return {"enabled": False, "entries": []}
+
+        entries = server._watchlist.get_all()
+        return {
+            "enabled": True,
+            "entries": [e.to_dict() for e in entries],
+            "active_count": len(server._watchlist.get_active()),
+            "new_count": len(server._watchlist.get_new()),
+            "stale_count": len(server._watchlist.get_stale()),
+        }
+
+    @app.post("/api/scanner/scan")
+    async def force_scan():
+        """Force an immediate scan (for testing)."""
+        if not server._scanner_available or not server._scanner:
+            return {"enabled": False, "error": "Scanner not available"}
+
+        try:
+            candidates = await server._scanner.force_scan()
+            return {
+                "enabled": True,
+                "candidates_found": len(candidates),
+                "candidates": [c.to_dict() for c in candidates],
+            }
+        except Exception as e:
+            logger.error(f"Force scan error: {e}")
+            return {"enabled": True, "error": str(e)}
+
+    @app.post("/api/scanner/add/{symbol}")
+    async def add_to_watchlist(symbol: str, reason: str = "manual"):
+        """Manually add a symbol to the watchlist."""
+        if not server._scanner_available or not server._watchlist:
+            return {"enabled": False, "error": "Scanner not available"}
+
+        try:
+            entry = await server._watchlist.add(
+                symbol=symbol.upper(),
+                reason=reason,
+            )
+            if entry:
+                return {"success": True, "symbol": symbol.upper(), "state": entry.state.value}
+            else:
+                return {"success": False, "error": "Watchlist at capacity"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @app.delete("/api/scanner/remove/{symbol}")
+    async def remove_from_watchlist(symbol: str):
+        """Remove a symbol from the watchlist."""
+        if not server._scanner_available or not server._watchlist:
+            return {"enabled": False, "error": "Scanner not available"}
+
+        try:
+            await server._watchlist.remove(symbol.upper())
+            return {"success": True, "symbol": symbol.upper()}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     # ========================================================================
     # Testing Routes (only for paper mode)
