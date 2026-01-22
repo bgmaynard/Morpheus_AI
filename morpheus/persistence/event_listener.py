@@ -87,8 +87,8 @@ class PersistenceListener:
             EventType.RISK_VETO: self._handle_risk_veto,
             EventType.ORDER_SUBMITTED: self._handle_order_submitted,
             EventType.ORDER_CONFIRMED: self._handle_order_confirmed,
-            EventType.FILL_RECEIVED: self._handle_fill_received,
-            EventType.POSITION_CLOSED: self._handle_position_closed,
+            EventType.ORDER_FILL_RECEIVED: self._handle_fill_received,
+            EventType.TRADE_CLOSED: self._handle_position_closed,
             EventType.REGIME_DETECTED: self._handle_regime_detected,
         }
         return handlers.get(event_type)
