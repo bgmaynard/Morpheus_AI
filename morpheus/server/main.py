@@ -62,6 +62,15 @@ except ImportError as e:
     logger.warning(f"Orchestrator not available: {e}")
     ORCHESTRATOR_AVAILABLE = False
 
+# Persistence imports (optional - graceful if database not available)
+try:
+    from morpheus.persistence.database import Database
+    from morpheus.persistence.event_listener import PersistenceListener
+    PERSISTENCE_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Persistence layer not available: {e}")
+    PERSISTENCE_AVAILABLE = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -252,8 +261,14 @@ class MorpheusServer:
         self._pipeline_available = False
         self._candle_aggregator: CandleAggregator | None = None
 
+        # Persistence layer
+        self._db: Database | None = None
+        self._persistence: PersistenceListener | None = None
+        self._persistence_available = False
+
         self._init_market_data()
         self._init_pipeline()
+        self._init_persistence()
 
     def _init_market_data(self):
         """Initialize Schwab market data client if credentials are available."""
@@ -408,6 +423,24 @@ class MorpheusServer:
         except Exception as e:
             logger.error(f"Failed to initialize signal pipeline: {e}")
             self._pipeline_available = False
+
+    def _init_persistence(self):
+        """Initialize persistence layer for logging all events."""
+        if not PERSISTENCE_AVAILABLE:
+            logger.warning("Persistence module not available - event logging disabled")
+            return
+
+        try:
+            # Initialize database (creates ./data/morpheus.db)
+            self._db = Database()
+            self._persistence = PersistenceListener(self._db)
+            self._persistence_available = True
+            logger.info("Persistence layer initialized (SQLite)")
+            logger.info(f"  - Database: {self._db.db_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize persistence: {e}")
+            self._persistence_available = False
 
     async def _handle_aggregated_candle(self, symbol: str, ohlcv: OHLCV, timestamp: datetime) -> None:
         """Handle completed 1-min candle from aggregator."""
@@ -843,10 +876,17 @@ class MorpheusServer:
                 await asyncio.sleep(1.0)  # Back off on error
 
     async def emit_event(self, event: Event):
-        """Emit an event to all WebSocket clients."""
+        """Emit an event to all WebSocket clients and persist to database."""
         self.state.event_count += 1
         await self.ws_manager.broadcast(event)
         logger.debug(f"Event emitted: {event.event_type.value}")
+
+        # Persist event to database (non-blocking)
+        if self._persistence_available and self._persistence:
+            try:
+                await self._persistence.on_event(event)
+            except Exception as e:
+                logger.error(f"Error persisting event: {e}")
 
         # Track pipeline-related events for monitoring
         pipeline_event_types = {
@@ -1611,6 +1651,71 @@ def create_app() -> FastAPI:
                 "risk_vetoed": len([e for e in events if e.get("event_type") == "RISK_VETO"]),
             },
         }
+
+    # ========================================================================
+    # Persistence/Stats Routes
+    # ========================================================================
+
+    @app.get("/api/stats/today")
+    async def get_today_stats():
+        """Get today's trading statistics from persistence layer."""
+        if not server._persistence_available or not server._persistence:
+            return {
+                "enabled": False,
+                "error": "Persistence layer not available",
+            }
+
+        try:
+            stats = server._persistence.get_today_stats()
+            return {
+                "enabled": True,
+                **stats,
+            }
+        except Exception as e:
+            logger.error(f"Error getting today's stats: {e}")
+            return {
+                "enabled": True,
+                "error": str(e),
+            }
+
+    @app.get("/api/stats/rejections")
+    async def get_rejection_reasons(days: int = 7):
+        """Get rejection reason breakdown."""
+        if not server._persistence_available or not server._persistence:
+            return {"enabled": False}
+
+        try:
+            from datetime import date, timedelta
+            start_date = (date.today() - timedelta(days=days)).isoformat()
+            reasons = server._persistence.decisions.count_rejection_reasons(start_date)
+            return {
+                "enabled": True,
+                "days": days,
+                "reasons": reasons,
+            }
+        except Exception as e:
+            logger.error(f"Error getting rejection reasons: {e}")
+            return {"enabled": True, "error": str(e)}
+
+    @app.get("/api/stats/trades")
+    async def get_trade_stats(days: int = 7):
+        """Get trade P&L summary."""
+        if not server._persistence_available or not server._persistence:
+            return {"enabled": False}
+
+        try:
+            from datetime import date, timedelta
+            start_date = (date.today() - timedelta(days=days)).isoformat()
+            end_date = date.today().isoformat()
+            summary = server._persistence.trades.get_pnl_summary(start_date, end_date)
+            return {
+                "enabled": True,
+                "days": days,
+                **summary,
+            }
+        except Exception as e:
+            logger.error(f"Error getting trade stats: {e}")
+            return {"enabled": True, "error": str(e)}
 
     # ========================================================================
     # Testing Routes (only for paper mode)
