@@ -56,6 +56,7 @@ except ImportError:
 try:
     from morpheus.orchestrator.pipeline import SignalPipeline, PipelineConfig
     from morpheus.features.indicators import OHLCV
+    from morpheus.data.candle_aggregator import CandleAggregator
     ORCHESTRATOR_AVAILABLE = True
 except ImportError as e:
     logger.warning(f"Orchestrator not available: {e}")
@@ -249,6 +250,7 @@ class MorpheusServer:
         # Signal pipeline (orchestrator)
         self._pipeline: SignalPipeline | None = None
         self._pipeline_available = False
+        self._candle_aggregator: CandleAggregator | None = None
 
         self._init_market_data()
         self._init_pipeline()
@@ -396,15 +398,44 @@ class MorpheusServer:
             logger.info(f"  - Permissive mode: {config.permissive_mode}")
             logger.info(f"  - Kill switch respect: {config.respect_kill_switch}")
 
+            # Create candle aggregator to build 1-min candles from streaming quotes
+            self._candle_aggregator = CandleAggregator(
+                on_candle=self._handle_aggregated_candle,
+                interval_seconds=60,  # 1-minute candles
+            )
+            logger.info("Candle aggregator initialized (1-min bars from streaming quotes)")
+
         except Exception as e:
             logger.error(f"Failed to initialize signal pipeline: {e}")
             self._pipeline_available = False
 
+    async def _handle_aggregated_candle(self, symbol: str, ohlcv: OHLCV, timestamp: datetime) -> None:
+        """Handle completed 1-min candle from aggregator."""
+        if not self._pipeline_available or not self._pipeline:
+            return
+
+        try:
+            # Feed the aggregated candle to the pipeline
+            await self._pipeline.on_candle(symbol, ohlcv, timestamp=timestamp)
+            logger.info(
+                f"[CANDLE] {symbol} {timestamp.strftime('%H:%M')} "
+                f"O={ohlcv.open:.2f} H={ohlcv.high:.2f} L={ohlcv.low:.2f} C={ohlcv.close:.2f} V={ohlcv.volume}"
+            )
+        except Exception as e:
+            logger.error(f"Error feeding aggregated candle to pipeline: {e}")
+
     async def _handle_streaming_quote(self, quote: QuoteUpdate) -> None:
         """Handle incoming quote from streaming."""
         try:
-            # Get the best available price
-            price = quote.last_price or quote.mark or quote.bid_price or 0.0
+            # Get the best available price - DO NOT use mark (it's unreliable garbage)
+            # Priority: last_price > bid/ask midpoint > bid_price
+            price = 0.0
+            if quote.last_price and quote.last_price > 0:
+                price = quote.last_price
+            elif quote.bid_price and quote.ask_price and quote.bid_price > 0 and quote.ask_price > 0:
+                price = (quote.bid_price + quote.ask_price) / 2
+            elif quote.bid_price and quote.bid_price > 0:
+                price = quote.bid_price
 
             # Only emit if we have meaningful price data
             if price <= 0:
@@ -432,7 +463,16 @@ class MorpheusServer:
             ))
             logger.debug(f"[STREAM] QUOTE {quote.symbol} ${price:.2f}")
 
-            # Feed quote to signal pipeline for strategy evaluation
+            # Feed quote to candle aggregator (builds 1-min candles)
+            if self._candle_aggregator:
+                await self._candle_aggregator.on_quote(
+                    symbol=quote.symbol,
+                    price=price,
+                    volume=quote.volume or 0,
+                    timestamp=quote.trade_time,
+                )
+
+            # Also feed quote directly to pipeline for real-time evaluation
             if self._pipeline_available and self._pipeline:
                 await self._pipeline.on_quote(
                     symbol=quote.symbol,
