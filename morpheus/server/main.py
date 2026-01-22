@@ -46,9 +46,20 @@ from morpheus.execution.guards import (
 try:
     from morpheus.broker.schwab_auth import SchwabAuth, TokenNotFoundError
     from morpheus.broker.schwab_market import SchwabMarketClient, SchwabMarketError
+    from morpheus.broker.schwab_trading import SchwabTradingClient, SchwabTradingError
+    from morpheus.broker.schwab_stream import SchwabStreamer, StreamerInfo, QuoteUpdate, AccountActivity
     SCHWAB_AVAILABLE = True
 except ImportError:
     SCHWAB_AVAILABLE = False
+
+# Orchestrator imports (optional - graceful if not fully configured)
+try:
+    from morpheus.orchestrator.pipeline import SignalPipeline, PipelineConfig
+    from morpheus.features.indicators import OHLCV
+    ORCHESTRATOR_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Orchestrator not available: {e}")
+    ORCHESTRATOR_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(
@@ -88,6 +99,7 @@ class HealthResponse(BaseModel):
     uptime_seconds: float
     event_count: int
     websocket_clients: int
+    pipeline_enabled: bool = False
 
 
 # ============================================================================
@@ -130,6 +142,13 @@ class MorpheusState:
             "risk": "standard",
             "guard": "standard",
         }
+
+        # Subscribed symbols for live streaming
+        self.subscribed_symbols: set[str] = set()
+
+        # Pipeline event history for monitoring (circular buffer)
+        self.pipeline_events: list[dict[str, Any]] = []
+        self.max_pipeline_events: int = 200
 
         logger.info("MorpheusState initialized with SAFE defaults")
         logger.info(f"  Trading Mode: {self.trading_mode.value}")
@@ -211,12 +230,28 @@ class MorpheusServer:
         self.ws_manager = WebSocketManager()
         self.confirmation_guard = create_confirmation_guard()
         self._heartbeat_task: asyncio.Task | None = None
+        self._market_data_task: asyncio.Task | None = None
+        self._trading_data_task: asyncio.Task | None = None
 
         # Market data client (initialized lazily)
         self._market_client: Any = None
+        self._trading_client: Any = None
         self._http_client: Any = None
         self._market_data_available = False
+        self._trading_available = False
+
+        # Streaming client
+        self._streamer: SchwabStreamer | None = None
+        self._streamer_available = False
+        self._use_streaming = True  # Use streaming instead of polling when available
+        self._auth: Any = None  # Keep reference for streamer token refresh
+
+        # Signal pipeline (orchestrator)
+        self._pipeline: SignalPipeline | None = None
+        self._pipeline_available = False
+
         self._init_market_data()
+        self._init_pipeline()
 
     def _init_market_data(self):
         """Initialize Schwab market data client if credentials are available."""
@@ -269,11 +304,170 @@ class MorpheusServer:
             # Create market client
             self._market_client = SchwabMarketClient(auth=auth, http_client=self._http_client)
             self._market_data_available = True
+            self._auth = auth  # Keep reference for streamer
             logger.info("Schwab market data client initialized successfully")
+
+            # Create trading client (uses same auth)
+            try:
+                self._trading_client = SchwabTradingClient(auth=auth, http_client=self._http_client)
+                self._trading_available = True
+                logger.info("Schwab trading client initialized successfully")
+            except Exception as e:
+                logger.warning(f"Failed to initialize trading client: {e}")
+                self._trading_available = False
+
+            # Initialize streaming client
+            self._init_streamer()
 
         except Exception as e:
             logger.error(f"Failed to initialize market data client: {e}")
             self._market_data_available = False
+
+    def _init_streamer(self):
+        """Initialize Schwab streaming client for real-time data."""
+        if not self._auth or not self._http_client:
+            logger.warning("Cannot initialize streamer - auth not available")
+            return
+
+        try:
+            # Get user preferences with streamer info
+            token = self._auth.get_token()
+            headers = {"Authorization": f"Bearer {token.access_token}", "Accept": "application/json"}
+            resp = self._http_client.get(
+                "https://api.schwabapi.com/trader/v1/userPreference",
+                headers=headers,
+            )
+
+            if resp.status_code != 200:
+                logger.error(f"Failed to get streamer info: {resp.status_code}")
+                return
+
+            data = resp.json()
+            streamer_info_list = data.get("streamerInfo", [])
+            if not streamer_info_list:
+                logger.error("No streamer info in user preferences")
+                return
+
+            info = streamer_info_list[0]
+            streamer_info = StreamerInfo(
+                socket_url=info.get("streamerSocketUrl", ""),
+                customer_id=info.get("schwabClientCustomerId", ""),
+                correl_id=info.get("schwabClientCorrelId", ""),
+                channel=info.get("schwabClientChannel", ""),
+                function_id=info.get("schwabClientFunctionId", ""),
+            )
+
+            # Create streamer with callbacks
+            self._streamer = SchwabStreamer(
+                streamer_info=streamer_info,
+                access_token=token.access_token,
+                on_quote=self._handle_streaming_quote,
+                on_account_activity=self._handle_streaming_account_activity,
+                on_error=self._handle_streaming_error,
+            )
+            self._streamer_available = True
+            logger.info("Schwab streaming client initialized successfully")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize streaming client: {e}")
+            self._streamer_available = False
+
+    def _init_pipeline(self):
+        """Initialize the signal pipeline (orchestrator)."""
+        if not ORCHESTRATOR_AVAILABLE:
+            logger.warning("Orchestrator module not available - pipeline disabled")
+            return
+
+        try:
+            # Create pipeline config (permissive for paper trading)
+            config = PipelineConfig(
+                permissive_mode=True,  # Allow more signals for testing
+                min_signal_confidence=0.0,  # Emit all signals
+                respect_kill_switch=True,
+            )
+
+            # Create pipeline with emit callback
+            self._pipeline = SignalPipeline(
+                config=config,
+                emit_event=self.emit_event,  # Wire to server's event emission
+            )
+            self._pipeline_available = True
+            logger.info("Signal pipeline initialized successfully (OBSERVATIONAL MODE)")
+            logger.info(f"  - Permissive mode: {config.permissive_mode}")
+            logger.info(f"  - Kill switch respect: {config.respect_kill_switch}")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize signal pipeline: {e}")
+            self._pipeline_available = False
+
+    async def _handle_streaming_quote(self, quote: QuoteUpdate) -> None:
+        """Handle incoming quote from streaming."""
+        try:
+            # Get the best available price
+            price = quote.last_price or quote.mark or quote.bid_price or 0.0
+
+            # Only emit if we have meaningful price data
+            if price <= 0:
+                logger.debug(f"[STREAM] Skipping quote for {quote.symbol} - no price data")
+                return
+
+            # Emit QUOTE_UPDATE event
+            await self.emit_event(create_event(
+                EventType.QUOTE_UPDATE,
+                symbol=quote.symbol,
+                payload={
+                    "symbol": quote.symbol,
+                    "bid": quote.bid_price,
+                    "ask": quote.ask_price,
+                    "last": price,
+                    "volume": quote.volume,
+                    "high": quote.high_price,
+                    "low": quote.low_price,
+                    "open": quote.open_price,
+                    "close": quote.close_price,
+                    "net_change": quote.net_change,
+                    "timestamp": quote.trade_time.isoformat() if quote.trade_time else datetime.now(timezone.utc).isoformat(),
+                    "source": "SCHWAB_STREAM",
+                },
+            ))
+            logger.debug(f"[STREAM] QUOTE {quote.symbol} ${price:.2f}")
+
+            # Feed quote to signal pipeline for strategy evaluation
+            if self._pipeline_available and self._pipeline:
+                await self._pipeline.on_quote(
+                    symbol=quote.symbol,
+                    last=price,
+                    bid=quote.bid_price,
+                    ask=quote.ask_price,
+                    volume=quote.volume,
+                    timestamp=quote.trade_time,
+                )
+        except Exception as e:
+            logger.error(f"Error handling streaming quote: {e}")
+
+    async def _handle_streaming_account_activity(self, activity: AccountActivity) -> None:
+        """Handle incoming account activity from streaming."""
+        try:
+            logger.info(f"[STREAM] ACCOUNT_ACTIVITY: {activity.message_type}")
+
+            # Emit appropriate events based on activity type
+            # Account activity can include order fills, position changes, etc.
+            if activity.message_type:
+                await self.emit_event(create_event(
+                    EventType.POSITION_UPDATE,
+                    payload={
+                        "account": activity.account,
+                        "message_type": activity.message_type,
+                        "data": activity.message_data,
+                        "source": "SCHWAB_STREAM",
+                    },
+                ))
+        except Exception as e:
+            logger.error(f"Error handling streaming account activity: {e}")
+
+    async def _handle_streaming_error(self, error: Exception) -> None:
+        """Handle streaming errors."""
+        logger.error(f"[STREAM] Error: {error}")
 
     def get_quote(self, symbol: str) -> dict[str, Any] | None:
         """Get current quote for a symbol."""
@@ -302,18 +496,50 @@ class MorpheusServer:
         period_type: str = "day",
         period: int = 1,
         frequency: int = 1,
+        frequency_type: str = "minute",
     ) -> list[dict[str, Any]]:
-        """Get historical candles for a symbol."""
+        """Get historical candles for a symbol.
+
+        For intraday data (frequency_type=minute), uses explicit date range
+        to get TODAY's data rather than previous day's data.
+        """
         if not self._market_data_available or not self._market_client:
             return []
 
         try:
+            # For intraday minute data, use explicit date range to get today's candles
+            start_date = None
+            end_date = None
+
+            if frequency_type == "minute" and period_type == "day":
+                from datetime import datetime, timezone, timedelta
+                import pytz
+
+                # Get current time in Eastern timezone (market timezone)
+                eastern = pytz.timezone('US/Eastern')
+                now_eastern = datetime.now(eastern)
+
+                # Market opens at 9:30 AM ET, but we want pre-market too
+                # Start from 4:00 AM ET (pre-market start)
+                today_start = now_eastern.replace(hour=4, minute=0, second=0, microsecond=0)
+
+                # If it's before 4 AM, look at previous day
+                if now_eastern.hour < 4:
+                    today_start = today_start - timedelta(days=1)
+
+                start_date = today_start.astimezone(timezone.utc)
+                end_date = datetime.now(timezone.utc)
+
+                logger.info(f"[CANDLES] Fetching intraday for {symbol}: {start_date} to {end_date}")
+
             candles = self._market_client.get_candles(
                 symbol=symbol.upper(),
                 period_type=period_type,
                 period=period,
-                frequency_type="minute",
+                frequency_type=frequency_type,
                 frequency=frequency,
+                start_date=start_date,
+                end_date=end_date,
             )
             return [
                 {
@@ -330,9 +556,130 @@ class MorpheusServer:
             logger.error(f"Failed to get candles for {symbol}: {e}")
             return []
 
+    def get_positions(self) -> list[dict[str, Any]]:
+        """Get current positions from Schwab account."""
+        if not self._trading_available or not self._trading_client:
+            return []
+
+        try:
+            positions = self._trading_client.get_positions()
+            return [
+                {
+                    "symbol": p.symbol,
+                    "quantity": p.quantity,
+                    "avg_price": p.avg_price,
+                    "current_price": p.current_price,
+                    "market_value": p.market_value,
+                    "unrealized_pnl": p.unrealized_pnl,
+                    "unrealized_pnl_pct": p.unrealized_pnl_pct,
+                    "asset_type": p.asset_type,
+                }
+                for p in positions
+            ]
+        except Exception as e:
+            logger.error(f"Failed to get positions: {e}")
+            return []
+
+    def get_orders(self, status: str | None = None) -> list[dict[str, Any]]:
+        """Get orders from Schwab account."""
+        if not self._trading_available or not self._trading_client:
+            return []
+
+        try:
+            orders = self._trading_client.get_orders(status=status)
+            return [
+                {
+                    "order_id": o.order_id,
+                    "symbol": o.symbol,
+                    "side": o.side.lower(),  # normalize to 'buy'/'sell'
+                    "quantity": o.quantity,
+                    "filled_quantity": o.filled_quantity,
+                    "order_type": o.order_type,
+                    "limit_price": o.limit_price,
+                    "stop_price": o.stop_price,
+                    "status": o.status,
+                    "entered_time": o.entered_time.isoformat(),
+                    "close_time": o.close_time.isoformat() if o.close_time else None,
+                }
+                for o in orders
+            ]
+        except Exception as e:
+            logger.error(f"Failed to get orders: {e}")
+            return []
+
+    def get_transactions(self) -> list[dict[str, Any]]:
+        """Get today's transactions/executions from Schwab account."""
+        if not self._trading_available or not self._trading_client:
+            return []
+
+        try:
+            transactions = self._trading_client.get_transactions()
+            return [
+                {
+                    "transaction_id": t.transaction_id,
+                    "order_id": t.order_id,
+                    "symbol": t.symbol,
+                    "side": t.side.lower(),
+                    "quantity": t.quantity,
+                    "price": t.price,
+                    "timestamp": t.timestamp.isoformat(),
+                    "transaction_type": t.transaction_type,
+                    "description": t.description,
+                }
+                for t in transactions
+            ]
+        except Exception as e:
+            logger.error(f"Failed to get transactions: {e}")
+            return []
+
+    async def _trading_data_loop(self):
+        """Background loop to periodically fetch and broadcast trading data."""
+        logger.info("Trading data loop starting...")
+
+        while True:
+            try:
+                await asyncio.sleep(5.0)  # Fetch every 5 seconds
+
+                if not self._trading_available:
+                    continue
+
+                # Fetch positions and emit events
+                positions = self.get_positions()
+                for pos in positions:
+                    await self.emit_event(create_event(
+                        EventType.POSITION_UPDATE,
+                        symbol=pos["symbol"],
+                        payload=pos,
+                    ))
+
+                # Log summary
+                if positions:
+                    logger.debug(f"[TRADING] Updated {len(positions)} positions")
+
+            except asyncio.CancelledError:
+                logger.info("Trading data loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in trading data loop: {e}")
+                await asyncio.sleep(5.0)
+
     async def start(self):
         """Start background tasks."""
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self._trading_data_task = asyncio.create_task(self._trading_data_loop())
+
+        # Start streamer if available, otherwise fall back to polling
+        if self._streamer_available and self._use_streaming and self._streamer:
+            await self._streamer.start()
+            logger.info("Schwab WebSocket streaming started (replacing polling)")
+        else:
+            self._market_data_task = asyncio.create_task(self._market_data_loop())
+            logger.info("Market data polling loop started (streaming not available)")
+
+        # Start signal pipeline (orchestrator)
+        if self._pipeline_available and self._pipeline:
+            await self._pipeline.start()
+            logger.info("Signal pipeline started (OBSERVATIONAL MODE - no auto-execution)")
 
         # Emit system start event
         await self.emit_event(create_event(
@@ -341,17 +688,42 @@ class MorpheusServer:
                 "trading_mode": self.state.trading_mode.value.upper(),
                 "live_armed": self.state.live_armed,
                 "kill_switch_active": self.state.kill_switch_active,
+                "streaming_enabled": self._streamer_available and self._use_streaming,
+                "pipeline_enabled": self._pipeline_available,
             },
         ))
 
         logger.info("MorpheusServer started")
+        logger.info("Trading data loop started")
 
     async def stop(self):
         """Stop background tasks."""
+        # Stop signal pipeline
+        if self._pipeline_available and self._pipeline:
+            await self._pipeline.stop()
+
+        # Stop streamer if running
+        if self._streamer:
+            await self._streamer.stop()
+
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
             try:
                 await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._market_data_task:
+            self._market_data_task.cancel()
+            try:
+                await self._market_data_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._trading_data_task:
+            self._trading_data_task.cancel()
+            try:
+                await self._trading_data_task
             except asyncio.CancelledError:
                 pass
 
@@ -381,11 +753,77 @@ class MorpheusServer:
             except Exception as e:
                 logger.error(f"Heartbeat error: {e}")
 
+    async def _market_data_loop(self):
+        """
+        Stream market data for subscribed symbols.
+
+        Fetches quotes every 1 second for all subscribed symbols
+        and emits QUOTE_UPDATE events via WebSocket.
+        """
+        logger.info("Market data loop starting...")
+
+        while True:
+            try:
+                await asyncio.sleep(1.0)  # 1 second quote interval
+
+                # Skip if no market data client or no subscriptions
+                if not self._market_data_available or not self.state.subscribed_symbols:
+                    continue
+
+                # Fetch quotes for all subscribed symbols
+                for symbol in list(self.state.subscribed_symbols):
+                    try:
+                        quote = self.get_quote(symbol)
+                        if quote:
+                            # Emit QUOTE_UPDATE event
+                            await self.emit_event(create_event(
+                                EventType.QUOTE_UPDATE,
+                                symbol=symbol,
+                                payload={
+                                    "symbol": quote["symbol"],
+                                    "bid": quote["bid"],
+                                    "ask": quote["ask"],
+                                    "last": quote["last"],
+                                    "volume": quote["volume"],
+                                    "timestamp": quote["timestamp"],
+                                    "is_tradeable": quote["is_tradeable"],
+                                    "is_market_open": quote["is_market_open"],
+                                    "source": "SCHWAB",
+                                },
+                            ))
+                            logger.info(f"[DATA] QUOTE_UPDATE {symbol} ${quote['last']:.2f}")
+                    except Exception as e:
+                        logger.error(f"Error fetching quote for {symbol}: {e}")
+
+            except asyncio.CancelledError:
+                logger.info("Market data loop stopped")
+                break
+            except Exception as e:
+                logger.error(f"Market data loop error: {e}")
+                await asyncio.sleep(1.0)  # Back off on error
+
     async def emit_event(self, event: Event):
         """Emit an event to all WebSocket clients."""
         self.state.event_count += 1
         await self.ws_manager.broadcast(event)
         logger.debug(f"Event emitted: {event.event_type.value}")
+
+        # Track pipeline-related events for monitoring
+        pipeline_event_types = {
+            EventType.FEATURES_COMPUTED,
+            EventType.REGIME_DETECTED,
+            EventType.SIGNAL_CANDIDATE,
+            EventType.SIGNAL_SCORED,
+            EventType.META_APPROVED,
+            EventType.META_REJECTED,
+            EventType.RISK_APPROVED,
+            EventType.RISK_VETO,
+        }
+        if event.event_type in pipeline_event_types:
+            self.state.pipeline_events.append(event.to_jsonl_dict())
+            # Keep only recent events
+            if len(self.state.pipeline_events) > self.state.max_pipeline_events:
+                self.state.pipeline_events = self.state.pipeline_events[-self.state.max_pipeline_events:]
 
     async def process_command(self, command: Command) -> CommandResult:
         """Process a command from UI."""
@@ -528,10 +966,120 @@ class MorpheusServer:
         ))
 
     async def _handle_set_symbol_chain(self, command: Command) -> CommandResult:
-        """Handle SET_SYMBOL_CHAIN - update active symbol."""
+        """Handle SET_SYMBOL_CHAIN - update active symbol and auto-subscribe."""
         symbol = command.payload.get("symbol", "").upper()
         self.state.active_symbol = symbol if symbol else None
-        logger.info(f"Active symbol set to: {symbol or 'NONE'}")
+
+        # Auto-subscribe to symbol for live data streaming
+        if symbol:
+            self.state.subscribed_symbols.add(symbol)
+            logger.info(f"Active symbol set to: {symbol} (subscribed for live data)")
+        else:
+            logger.info("Active symbol cleared")
+
+        return CommandResult(accepted=True, command_id=command.command_id)
+
+    async def _handle_subscribe_symbol(self, command: Command) -> CommandResult:
+        """Handle SUBSCRIBE_SYMBOL - subscribe to live quote updates."""
+        symbol = command.payload.get("symbol", "").upper()
+        if not symbol:
+            return CommandResult(
+                accepted=False,
+                command_id=command.command_id,
+                message="Symbol required",
+            )
+
+        self.state.subscribed_symbols.add(symbol)
+
+        # Subscribe via streaming if available
+        if self._streamer_available and self._use_streaming and self._streamer:
+            await self._streamer.subscribe_quotes([symbol])
+
+        # Add to signal pipeline for strategy evaluation
+        if self._pipeline_available and self._pipeline:
+            self._pipeline.add_symbol(symbol)
+            # Load historical candles for warmup (in background)
+            asyncio.create_task(self._warmup_pipeline_symbol(symbol))
+
+        logger.info(f"Subscribed to {symbol}. Active subscriptions: {self.state.subscribed_symbols}")
+        return CommandResult(accepted=True, command_id=command.command_id)
+
+    async def _warmup_pipeline_symbol(self, symbol: str) -> None:
+        """Load historical candles to warmup the pipeline for a symbol."""
+        if not self._pipeline_available or not self._pipeline:
+            return
+        if not self._market_data_available or not self._market_client:
+            logger.warning(f"[WARMUP] Cannot warmup {symbol} - market data not available")
+            return
+
+        try:
+            logger.info(f"[WARMUP] Loading historical candles for {symbol}...")
+
+            # Fetch daily candles for feature calculation (need ~60 bars)
+            candles = self.get_candles(
+                symbol=symbol,
+                period_type="month",
+                period=3,  # 3 months of daily data
+                frequency_type="daily",
+                frequency=1,
+            )
+
+            if not candles:
+                logger.warning(f"[WARMUP] No historical candles for {symbol}")
+                return
+
+            # Feed candles to pipeline
+            from morpheus.features.indicators import OHLCV
+            fed_count = 0
+            for candle in candles:
+                ohlcv = OHLCV(
+                    open=candle["open"],
+                    high=candle["high"],
+                    low=candle["low"],
+                    close=candle["close"],
+                    volume=candle["volume"],
+                    timestamp=datetime.fromtimestamp(candle["time"], tz=timezone.utc),
+                )
+                await self._pipeline.on_candle(symbol, ohlcv)
+                fed_count += 1
+
+            logger.info(f"[WARMUP] Fed {fed_count} candles to pipeline for {symbol}")
+
+            # Check warmup status
+            status = self._pipeline.get_status()
+            warmup = status.get("warmup_status", {}).get(symbol, {})
+            logger.info(f"[WARMUP] {symbol} warmup complete: {warmup.get('complete', False)}")
+
+        except Exception as e:
+            logger.error(f"[WARMUP] Failed to warmup {symbol}: {e}")
+
+    async def _handle_unsubscribe_symbol(self, command: Command) -> CommandResult:
+        """Handle UNSUBSCRIBE_SYMBOL - unsubscribe from live quote updates."""
+        symbol = command.payload.get("symbol", "").upper()
+        if symbol in self.state.subscribed_symbols:
+            self.state.subscribed_symbols.discard(symbol)
+
+            # Unsubscribe via streaming if available
+            if self._streamer_available and self._use_streaming and self._streamer:
+                await self._streamer.unsubscribe_quotes([symbol])
+
+            # Remove from signal pipeline
+            if self._pipeline_available and self._pipeline:
+                self._pipeline.remove_symbol(symbol)
+
+            logger.info(f"Unsubscribed from {symbol}. Active subscriptions: {self.state.subscribed_symbols}")
+        return CommandResult(accepted=True, command_id=command.command_id)
+
+    async def _handle_clear_subscriptions(self, command: Command) -> CommandResult:
+        """Handle CLEAR_SUBSCRIPTIONS - clear all symbol subscriptions."""
+        count = len(self.state.subscribed_symbols)
+
+        # Unsubscribe all via streaming
+        if self._streamer_available and self._use_streaming and self._streamer and count > 0:
+            await self._streamer.unsubscribe_quotes(list(self.state.subscribed_symbols))
+
+        self.state.subscribed_symbols.clear()
+        logger.info(f"Cleared {count} subscriptions. Active subscriptions: {self.state.subscribed_symbols}")
         return CommandResult(accepted=True, command_id=command.command_id)
 
     async def _handle_arm_live_trading(self, command: Command) -> CommandResult:
@@ -583,6 +1131,10 @@ class MorpheusServer:
         self.state.live_armed = False  # Also disarm
         logger.warning("KILL SWITCH ACTIVATED")
 
+        # Sync with signal pipeline
+        if self._pipeline_available and self._pipeline:
+            self._pipeline.set_kill_switch(True)
+
         await self.emit_event(create_event(
             EventType.HEARTBEAT,
             payload={
@@ -597,6 +1149,10 @@ class MorpheusServer:
         """Handle DEACTIVATE_KILL_SWITCH - reset kill switch."""
         self.state.kill_switch_active = False
         logger.info("Kill switch deactivated")
+
+        # Sync with signal pipeline
+        if self._pipeline_available and self._pipeline:
+            self._pipeline.set_kill_switch(False)
 
         await self.emit_event(create_event(
             EventType.HEARTBEAT,
@@ -705,6 +1261,7 @@ def create_app() -> FastAPI:
             uptime_seconds=uptime,
             event_count=server.state.event_count,
             websocket_clients=server.ws_manager.client_count,
+            pipeline_enabled=server._pipeline_available,
         )
 
     @app.get("/api/ui/state")
@@ -766,6 +1323,7 @@ def create_app() -> FastAPI:
         period_type: str = "day",
         period: int = 1,
         frequency: int = 1,
+        frequency_type: str = "minute",
     ):
         """Get historical candles for a symbol."""
         if not server._market_data_available:
@@ -779,6 +1337,7 @@ def create_app() -> FastAPI:
             period_type=period_type,
             period=period,
             frequency=frequency,
+            frequency_type=frequency_type,
         )
 
         return {"symbol": symbol.upper(), "candles": candles}
@@ -803,6 +1362,46 @@ def create_app() -> FastAPI:
         return {"quotes": results}
 
     # ========================================================================
+    # Trading Data Routes (Positions, Orders, Transactions)
+    # ========================================================================
+
+    @app.get("/api/trading/positions")
+    async def get_positions():
+        """Get current account positions."""
+        if not server._trading_available:
+            raise HTTPException(
+                status_code=503,
+                detail="Trading data not available. Configure Schwab credentials."
+            )
+
+        positions = server.get_positions()
+        return {"positions": positions}
+
+    @app.get("/api/trading/orders")
+    async def get_orders(status: str | None = None):
+        """Get orders (optionally filtered by status)."""
+        if not server._trading_available:
+            raise HTTPException(
+                status_code=503,
+                detail="Trading data not available. Configure Schwab credentials."
+            )
+
+        orders = server.get_orders(status=status)
+        return {"orders": orders}
+
+    @app.get("/api/trading/transactions")
+    async def get_transactions():
+        """Get today's transactions/executions."""
+        if not server._trading_available:
+            raise HTTPException(
+                status_code=503,
+                detail="Trading data not available. Configure Schwab credentials."
+            )
+
+        transactions = server.get_transactions()
+        return {"transactions": transactions}
+
+    # ========================================================================
     # OAuth Setup Routes
     # ========================================================================
 
@@ -820,10 +1419,9 @@ def create_app() -> FastAPI:
 
         from urllib.parse import urlencode
         params = {
-            "response_type": "code",
             "client_id": client_id,
             "redirect_uri": redirect_uri,
-            "scope": "readonly",
+            "response_type": "code",
         }
         auth_url = f"https://api.schwabapi.com/v1/oauth/authorize?{urlencode(params)}"
 
@@ -898,6 +1496,81 @@ def create_app() -> FastAPI:
         except Exception as e:
             logger.error(f"OAuth callback failed: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+
+    # ========================================================================
+    # Pipeline Status Routes
+    # ========================================================================
+
+    @app.get("/api/pipeline/status")
+    async def get_pipeline_status():
+        """Get signal pipeline status and diagnostics."""
+        if not server._pipeline_available or not server._pipeline:
+            return {
+                "enabled": False,
+                "message": "Signal pipeline not available",
+            }
+
+        status = server._pipeline.get_status()
+        return {
+            "enabled": True,
+            "status": status,
+        }
+
+    @app.get("/api/pipeline/events")
+    async def get_pipeline_events(limit: int = 50, event_type: str | None = None):
+        """Get recent pipeline events for monitoring."""
+        events = server.state.pipeline_events.copy()
+
+        # Filter by event type if specified
+        if event_type:
+            events = [e for e in events if e.get("event_type") == event_type]
+
+        # Return most recent first, limited
+        events = list(reversed(events))[:limit]
+
+        return {
+            "events": events,
+            "total_count": len(server.state.pipeline_events),
+        }
+
+    @app.get("/api/pipeline/monitor")
+    async def get_pipeline_monitor():
+        """Get full pipeline monitoring data for the monitor panel."""
+        if not server._pipeline_available or not server._pipeline:
+            return {
+                "enabled": False,
+                "message": "Signal pipeline not available",
+            }
+
+        status = server._pipeline.get_status()
+
+        # Get recent events grouped by type
+        events = server.state.pipeline_events.copy()
+        recent_signals = [e for e in events if e.get("event_type") == "SIGNAL_CANDIDATE"][-10:]
+        recent_scores = [e for e in events if e.get("event_type") == "SIGNAL_SCORED"][-10:]
+        recent_gate = [e for e in events if e.get("event_type") in ("META_APPROVED", "META_REJECTED")][-10:]
+        recent_risk = [e for e in events if e.get("event_type") in ("RISK_APPROVED", "RISK_VETO")][-10:]
+        recent_regime = [e for e in events if e.get("event_type") == "REGIME_DETECTED"][-10:]
+
+        return {
+            "enabled": True,
+            "status": status,
+            "recent_events": {
+                "signals": list(reversed(recent_signals)),
+                "scores": list(reversed(recent_scores)),
+                "gate_decisions": list(reversed(recent_gate)),
+                "risk_decisions": list(reversed(recent_risk)),
+                "regime_detections": list(reversed(recent_regime)),
+            },
+            "event_counts": {
+                "total": len(events),
+                "signals": len([e for e in events if e.get("event_type") == "SIGNAL_CANDIDATE"]),
+                "approved": len([e for e in events if e.get("event_type") == "META_APPROVED"]),
+                "rejected": len([e for e in events if e.get("event_type") == "META_REJECTED"]),
+                "risk_approved": len([e for e in events if e.get("event_type") == "RISK_APPROVED"]),
+                "risk_vetoed": len([e for e in events if e.get("event_type") == "RISK_VETO"]),
+            },
+        }
 
     # ========================================================================
     # Testing Routes (only for paper mode)

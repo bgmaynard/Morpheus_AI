@@ -148,10 +148,9 @@ class SchwabAuth:
         User must visit this URL, authorize, and provide the callback code.
         """
         params = {
-            "response_type": "code",
             "client_id": self.client_id,
             "redirect_uri": self.redirect_uri,
-            "scope": "readonly",
+            "response_type": "code",
         }
         return f"{self.AUTH_URL}?{urlencode(params)}"
 
