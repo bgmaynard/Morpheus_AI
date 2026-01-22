@@ -1038,9 +1038,9 @@ class MorpheusServer:
                     low=candle["low"],
                     close=candle["close"],
                     volume=candle["volume"],
-                    timestamp=datetime.fromtimestamp(candle["time"], tz=timezone.utc),
                 )
-                await self._pipeline.on_candle(symbol, ohlcv)
+                candle_ts = datetime.fromtimestamp(candle["time"], tz=timezone.utc)
+                await self._pipeline.on_candle(symbol, ohlcv, timestamp=candle_ts)
                 fed_count += 1
 
             logger.info(f"[WARMUP] Fed {fed_count} candles to pipeline for {symbol}")
