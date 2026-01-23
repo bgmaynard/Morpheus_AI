@@ -7,6 +7,7 @@ Evaluates trades against account-level risk constraints:
 - Daily loss limits
 - Drawdown guards
 - Kill switch status
+- Room-to-profit (spread/slippage costs)
 
 All evaluation is DETERMINISTIC: same input -> same decision.
 
@@ -19,6 +20,7 @@ Phase 6 Scope:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -32,6 +34,9 @@ from morpheus.risk.base import (
     VetoReason,
     RISK_SCHEMA_VERSION,
 )
+from morpheus.risk.room_to_profit import RoomToProfitCalculator, RoomToProfitConfig
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -332,3 +337,162 @@ def create_permissive_risk_manager() -> PermissiveRiskManager:
 def create_strict_risk_manager() -> StrictRiskManager:
     """Factory function to create a StrictRiskManager."""
     return StrictRiskManager()
+
+
+class RoomToProfitRiskManager(RiskOverlay):
+    """
+    Risk manager with integrated room-to-profit checking.
+
+    Wraps another risk manager and adds spread/slippage cost analysis.
+    A trade is vetoed if execution costs would eat too much of the potential profit.
+
+    This ensures we only take trades where there's realistic room to profit
+    after accounting for:
+    - Bid-ask spread
+    - Expected slippage
+    - Commissions (if any)
+
+    The spread is extracted from the gate result's feature snapshot.
+    """
+
+    def __init__(
+        self,
+        base_manager: RiskOverlay | None = None,
+        rtp_config: RoomToProfitConfig | None = None,
+        default_spread_pct: float = 0.5,  # Assume 0.5% spread if not in features
+    ):
+        """
+        Initialize with a base risk manager and room-to-profit config.
+
+        Args:
+            base_manager: Underlying risk manager (defaults to StandardRiskManager)
+            rtp_config: Room-to-profit configuration
+            default_spread_pct: Default spread % to use if not available in features
+        """
+        self._base = base_manager or StandardRiskManager()
+        self._rtp = RoomToProfitCalculator(rtp_config)
+        self._default_spread_pct = default_spread_pct
+
+    @property
+    def name(self) -> str:
+        return "room_to_profit_risk_manager"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def description(self) -> str:
+        return "Risk manager with spread/slippage cost analysis"
+
+    def evaluate(
+        self,
+        gate_result: GateResult,
+        position_size: PositionSize,
+        account: AccountState,
+    ) -> RiskResult:
+        """
+        Evaluate position with room-to-profit analysis.
+
+        First runs the base manager's checks, then if approved,
+        performs room-to-profit analysis.
+        """
+        # Run base manager first
+        base_result = self._base.evaluate(gate_result, position_size, account)
+
+        # If base manager vetoed, return that result
+        if base_result.is_vetoed:
+            return base_result
+
+        # Extract data for room-to-profit analysis
+        entry_price = float(position_size.entry_price)
+        stop_price = float(position_size.stop_price) if position_size.stop_price else None
+
+        # Get target price from signal
+        target_price = None
+        direction = "long"
+
+        if gate_result.scored_signal and gate_result.scored_signal.signal:
+            signal = gate_result.scored_signal.signal
+            target_price = signal.target_reference
+            direction = signal.direction.value if signal.direction else "long"
+
+        # If no stop or target, we can't do room-to-profit analysis
+        if not stop_price or not target_price:
+            logger.debug("No stop/target for room-to-profit, skipping check")
+            return base_result
+
+        # Get spread from feature snapshot
+        spread_pct = self._default_spread_pct
+        bid = entry_price * 0.999  # Estimate bid
+        ask = entry_price * 1.001  # Estimate ask
+
+        if gate_result.scored_signal:
+            fs = gate_result.scored_signal.feature_snapshot
+            if "spread_pct" in fs and fs["spread_pct"] is not None:
+                spread_pct = float(fs["spread_pct"])
+            if "bid" in fs and fs["bid"] is not None:
+                bid = float(fs["bid"])
+            if "ask" in fs and fs["ask"] is not None:
+                ask = float(fs["ask"])
+            elif spread_pct:
+                # Reconstruct bid/ask from spread_pct
+                half_spread = entry_price * (spread_pct / 100) / 2
+                bid = entry_price - half_spread
+                ask = entry_price + half_spread
+
+        # Calculate room-to-profit
+        rtp = self._rtp.calculate(
+            symbol=gate_result.scored_signal.symbol if gate_result.scored_signal else "",
+            entry_price=entry_price,
+            stop_price=stop_price,
+            target_price=target_price,
+            bid=bid,
+            ask=ask,
+            direction=direction,
+        )
+
+        # Check if trade has room to profit
+        if not rtp.has_room:
+            logger.info(
+                f"Room-to-profit veto: {rtp.symbol} - {rtp.rejection_reason} "
+                f"(net R:R {rtp.net_rr_ratio:.2f}, breakeven {rtp.breakeven_pct:.2f}%)"
+            )
+            return self.create_vetoed(
+                gate_result=gate_result,
+                position_size=position_size,
+                account=account,
+                reasons=(VetoReason.INSUFFICIENT_ROOM_TO_PROFIT,),
+                details=f"{rtp.rejection_reason}. Net R:R: {rtp.net_rr_ratio:.2f}, "
+                        f"Breakeven move: {rtp.breakeven_pct:.2f}%, "
+                        f"Spread: {rtp.execution_costs.spread_pct:.2f}%",
+            )
+
+        # Room-to-profit check passed
+        logger.debug(
+            f"Room-to-profit OK: {rtp.symbol} - net R:R {rtp.net_rr_ratio:.2f}, "
+            f"score {rtp.room_score:.0f}"
+        )
+
+        # Return approved result with room-to-profit details in reason_details
+        return RiskResult(
+            schema_version=RISK_SCHEMA_VERSION,
+            gate_result=base_result.gate_result,
+            decision=RiskDecision.APPROVED,
+            veto_reasons=(),
+            reason_details=f"{base_result.reason_details} | Room-to-profit: "
+                          f"net R:R {rtp.net_rr_ratio:.2f}, score {rtp.room_score:.0f}",
+            position_size=base_result.position_size,
+            overlay_name=self.name,
+            overlay_version=self.version,
+            account_snapshot=base_result.account_snapshot,
+            evaluated_at=base_result.evaluated_at,
+        )
+
+
+def create_room_to_profit_manager(
+    base_manager: RiskOverlay | None = None,
+    rtp_config: RoomToProfitConfig | None = None,
+) -> RoomToProfitRiskManager:
+    """Factory function to create a RoomToProfitRiskManager."""
+    return RoomToProfitRiskManager(base_manager, rtp_config)

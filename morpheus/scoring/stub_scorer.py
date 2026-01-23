@@ -210,7 +210,7 @@ class StubScorer(Scorer):
                 contributing.append("volatility_penalty")
                 rationale_parts.append(f"High volatility ({atr_pct:.2f}%): -{cfg.high_volatility_penalty:.2f}")
 
-        # Build feature snapshot for audit
+        # Build feature snapshot for audit (include spread for risk evaluation)
         feature_snapshot = {
             "trend_strength": trend_strength,
             "rsi_14": rsi,
@@ -218,6 +218,13 @@ class StubScorer(Scorer):
             "macd_histogram": macd_hist,
             "atr_pct": atr_pct,
         }
+
+        # Include spread data from snapshot for room-to-profit analysis
+        if features.snapshot:
+            feature_snapshot["spread"] = features.snapshot.spread
+            feature_snapshot["spread_pct"] = features.snapshot.spread_pct
+            feature_snapshot["bid"] = features.snapshot.bid
+            feature_snapshot["ask"] = features.snapshot.ask
 
         # Clamp confidence to [0, 1]
         final_confidence = max(0.0, min(1.0, confidence))

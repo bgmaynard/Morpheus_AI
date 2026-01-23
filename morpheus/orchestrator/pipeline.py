@@ -64,7 +64,12 @@ from morpheus.risk.base import (
     RiskDecision,
 )
 from morpheus.risk.position_sizer import StandardPositionSizer, PositionSizerConfig
-from morpheus.risk.risk_manager import PermissiveRiskManager, StandardRiskManager
+from morpheus.risk.risk_manager import (
+    PermissiveRiskManager,
+    StandardRiskManager,
+    RoomToProfitRiskManager,
+)
+from morpheus.risk.room_to_profit import RoomToProfitConfig
 from morpheus.risk.kill_switch import KillSwitch, KillSwitchResult
 
 # Data
@@ -97,6 +102,11 @@ class PipelineConfig:
 
     # Kill switch respected even in permissive mode
     respect_kill_switch: bool = True
+
+    # Room-to-profit checking (spread/slippage awareness)
+    enable_room_to_profit: bool = True  # Check execution costs before approval
+    min_net_rr_ratio: float = 1.5  # Minimum net R:R after costs
+    max_spread_pct: float = 1.5  # Max spread % to allow trade
 
 
 @dataclass
@@ -197,15 +207,30 @@ class SignalPipeline:
 
         # Risk manager
         if self.config.permissive_mode:
-            self._risk_manager = PermissiveRiskManager()
+            base_risk_manager = PermissiveRiskManager()
         else:
-            self._risk_manager = StandardRiskManager()
+            base_risk_manager = StandardRiskManager()
+
+        # Wrap with room-to-profit checking if enabled
+        if self.config.enable_room_to_profit:
+            rtp_config = RoomToProfitConfig(
+                min_net_rr_ratio=self.config.min_net_rr_ratio,
+                max_spread_pct=self.config.max_spread_pct,
+            )
+            self._risk_manager = RoomToProfitRiskManager(
+                base_manager=base_risk_manager,
+                rtp_config=rtp_config,
+            )
+            logger.info("[PIPELINE] Room-to-profit checking enabled")
+        else:
+            self._risk_manager = base_risk_manager
 
         # Kill switch
         self._kill_switch = KillSwitch()
 
         logger.info(
-            f"[PIPELINE] Initialized with permissive_mode={self.config.permissive_mode}"
+            f"[PIPELINE] Initialized with permissive_mode={self.config.permissive_mode}, "
+            f"room_to_profit={self.config.enable_room_to_profit}"
         )
 
     def _register_strategies(self) -> None:

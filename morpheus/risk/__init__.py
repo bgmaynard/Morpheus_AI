@@ -25,9 +25,18 @@ from morpheus.risk.risk_manager import (
     StandardRiskManager,
     PermissiveRiskManager,
     StrictRiskManager,
+    RoomToProfitRiskManager,
     create_standard_risk_manager,
     create_permissive_risk_manager,
     create_strict_risk_manager,
+    create_room_to_profit_manager,
+)
+from morpheus.risk.room_to_profit import (
+    ExecutionCosts,
+    RoomToProfit,
+    RoomToProfitConfig,
+    RoomToProfitCalculator,
+    calculate_optimal_target,
 )
 from morpheus.risk.kill_switch import (
     KillSwitchTrigger,
@@ -66,9 +75,17 @@ __all__ = [
     "StandardRiskManager",
     "PermissiveRiskManager",
     "StrictRiskManager",
+    "RoomToProfitRiskManager",
     "create_standard_risk_manager",
     "create_permissive_risk_manager",
     "create_strict_risk_manager",
+    "create_room_to_profit_manager",
+    # Room-to-Profit
+    "ExecutionCosts",
+    "RoomToProfit",
+    "RoomToProfitConfig",
+    "RoomToProfitCalculator",
+    "calculate_optimal_target",
     # Kill Switch
     "KillSwitchTrigger",
     "KillSwitchState",

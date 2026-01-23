@@ -44,6 +44,7 @@ class VetoReason(Enum):
     INSUFFICIENT_BUYING_POWER = "insufficient_buying_power"
     SYMBOL_BLOCKED = "symbol_blocked"
     MANUAL_HALT = "manual_halt"
+    INSUFFICIENT_ROOM_TO_PROFIT = "insufficient_room_to_profit"  # Spread/slippage eats profit
 
 
 class RiskDecision(Enum):
