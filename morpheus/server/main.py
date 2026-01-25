@@ -471,8 +471,9 @@ class MorpheusServer:
             logger.warning("Scanner module not available")
             return
 
-        if not self._market_data_available:
-            logger.warning("Scanner requires market data - disabled")
+        # Scanner can run with MAX_AI_SCANNER even without Schwab market data
+        if not self._market_data_available and not MAX_AI_SCANNER_AVAILABLE:
+            logger.warning("Scanner requires market data or MAX_AI_SCANNER - disabled")
             return
 
         try:
