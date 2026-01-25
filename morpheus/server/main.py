@@ -80,6 +80,14 @@ except ImportError as e:
     logger.warning(f"Scanner not available: {e}")
     SCANNER_AVAILABLE = False
 
+# MAX_AI Scanner integration (discovery source)
+try:
+    from morpheus.scanner.max_ai import MaxAIScannerClient
+    MAX_AI_SCANNER_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"MAX_AI Scanner client not available: {e}")
+    MAX_AI_SCANNER_AVAILABLE = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -486,10 +494,36 @@ class MorpheusServer:
                 max_watchlist_size=20,
             )
 
-            # Create fetch function using market client
+            # Initialize MAX_AI Scanner client (SINGLE SOURCE OF TRUTH)
+            # Per integration spec: Morpheus_AI consumes discovery from MAX_AI_SCANNER only
+            self._max_ai_client: MaxAIScannerClient | None = None
+            if MAX_AI_SCANNER_AVAILABLE:
+                self._max_ai_client = MaxAIScannerClient(
+                    base_url="http://127.0.0.1:8787",
+                    timeout=5.0,
+                )
+                logger.info("MAX_AI Scanner client initialized")
+
+            # Create fetch function - uses MAX_AI_SCANNER as primary source
             async def fetch_movers():
+                # PRIMARY: Use MAX_AI_SCANNER for discovery
+                if self._max_ai_client:
+                    movers = await self._max_ai_client.fetch_movers(
+                        profile="FAST_MOVERS",
+                        limit=50,
+                    )
+                    if movers:
+                        logger.debug(f"[MAX_AI] Got {len(movers)} movers from scanner service")
+                        return movers
+                    else:
+                        logger.warning("[MAX_AI] Scanner returned empty - service may be down")
+
+                # FALLBACK: Only if MAX_AI_SCANNER is completely unavailable
+                # This should rarely happen in production
                 if self._market_client:
+                    logger.warning("[FALLBACK] Using Schwab movers - MAX_AI_SCANNER preferred!")
                     return self._market_client.get_all_movers()
+
                 return []
 
             # Create scanner with callback
@@ -507,6 +541,10 @@ class MorpheusServer:
 
             self._scanner_available = True
             logger.info("Scanner initialized (auto-discovery enabled)")
+            if self._max_ai_client:
+                logger.info("  - Discovery source: MAX_AI_SCANNER (http://127.0.0.1:8787)")
+            else:
+                logger.info("  - Discovery source: Schwab Movers API (fallback)")
             logger.info(f"  - Price range: ${scanner_config.min_price}-${scanner_config.max_price}")
             logger.info(f"  - Min RVOL: {scanner_config.min_rvol}x")
             logger.info(f"  - Scan interval: {scanner_config.scan_interval_seconds}s")
@@ -920,6 +958,11 @@ class MorpheusServer:
             await self._scanner.stop()
         if self._watchlist:
             await self._watchlist.stop()
+
+        # Close MAX_AI Scanner client
+        if hasattr(self, '_max_ai_client') and self._max_ai_client:
+            await self._max_ai_client.close()
+            logger.info("MAX_AI Scanner client closed")
 
         # Stop signal pipeline
         if self._pipeline_available and self._pipeline:
