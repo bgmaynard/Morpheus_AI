@@ -34,6 +34,7 @@ class EventType(str, Enum):
 
     # Strategy Signals
     SIGNAL_CANDIDATE = "SIGNAL_CANDIDATE"
+    SIGNAL_OBSERVED = "SIGNAL_OBSERVED"  # Signal in observe-only mode (not actionable)
     SIGNAL_SCORED = "SIGNAL_SCORED"
 
     # Meta Gate
@@ -74,6 +75,14 @@ class EventType(str, Enum):
     SYSTEM_START = "SYSTEM_START"
     SYSTEM_STOP = "SYSTEM_STOP"
     HEARTBEAT = "HEARTBEAT"
+
+    # Scanner Events (from MAX_AI_SCANNER)
+    MARKET_HALT = "MARKET_HALT"
+    MARKET_RESUME = "MARKET_RESUME"
+    SCANNER_GAP_SIGNAL = "SCANNER_GAP_SIGNAL"
+    SCANNER_MOMENTUM_SIGNAL = "SCANNER_MOMENTUM_SIGNAL"
+    SCANNER_HOD_SIGNAL = "SCANNER_HOD_SIGNAL"
+    SCANNER_SYMBOL_DISCOVERED = "SCANNER_SYMBOL_DISCOVERED"
 
 
 class Event(BaseModel):

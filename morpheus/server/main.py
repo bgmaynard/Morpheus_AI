@@ -83,6 +83,7 @@ except ImportError as e:
 # MAX_AI Scanner integration (discovery source)
 try:
     from morpheus.scanner.max_ai import MaxAIScannerClient
+    from morpheus.integrations.max_ai_scanner import ScannerIntegration, ScannerIntegrationConfig
     MAX_AI_SCANNER_AVAILABLE = True
 except ImportError as e:
     logger.warning(f"MAX_AI Scanner client not available: {e}")
@@ -505,9 +506,11 @@ class MorpheusServer:
                 )
                 logger.info("MAX_AI Scanner client initialized")
 
-            # Create fetch function - uses MAX_AI_SCANNER as primary source
+            # Create fetch function - uses MAX_AI_SCANNER as ONLY source
+            # Per integration spec: NO FALLBACK - if scanner down, return empty
             async def fetch_movers():
-                # PRIMARY: Use MAX_AI_SCANNER for discovery
+                # ONLY use MAX_AI_SCANNER for discovery
+                # NO FALLBACK to Schwab movers - scanner is single source of truth
                 if self._max_ai_client:
                     movers = await self._max_ai_client.fetch_movers(
                         profile="FAST_MOVERS",
@@ -517,14 +520,11 @@ class MorpheusServer:
                         logger.debug(f"[MAX_AI] Got {len(movers)} movers from scanner service")
                         return movers
                     else:
-                        logger.warning("[MAX_AI] Scanner returned empty - service may be down")
+                        logger.warning("[MAX_AI] Scanner returned empty - Morpheus entering IDLE")
+                        return []
 
-                # FALLBACK: Only if MAX_AI_SCANNER is completely unavailable
-                # This should rarely happen in production
-                if self._market_client:
-                    logger.warning("[FALLBACK] Using Schwab movers - MAX_AI_SCANNER preferred!")
-                    return self._market_client.get_all_movers()
-
+                # No MAX_AI client = no discovery
+                logger.warning("[MAX_AI] Scanner client not available - no discovery possible")
                 return []
 
             # Create scanner with callback
@@ -549,6 +549,33 @@ class MorpheusServer:
             logger.info(f"  - Price range: ${scanner_config.min_price}-${scanner_config.max_price}")
             logger.info(f"  - Min RVOL: {scanner_config.min_rvol}x")
             logger.info(f"  - Scan interval: {scanner_config.scan_interval_seconds}s")
+
+            # Initialize Scanner Integration (event mapping, halt tracking)
+            self._scanner_integration = None
+            if MAX_AI_SCANNER_AVAILABLE:
+                integration_config = ScannerIntegrationConfig(
+                    symbol_poll_interval=30.0,
+                    halt_poll_interval=10.0,
+                    profiles=["FAST_MOVERS", "GAPPERS", "TOP_GAINERS"],
+                    max_symbols=25,
+                    auto_subscribe=True,
+                    emit_discovery_events=True,
+                )
+                self._scanner_integration = ScannerIntegration(
+                    config=integration_config,
+                    on_event=self._handle_scanner_event,
+                    on_symbol_discovered=self._handle_scanner_symbol_discovered,
+                    on_symbol_removed=self._handle_scanner_symbol_removed,
+                )
+                logger.info("Scanner Integration initialized (events + halts)")
+
+                # Wire scanner context to pipeline for external augmentation
+                # This allows FeatureContext to include scanner_score, gap_pct, etc.
+                if self._pipeline_available and self._pipeline:
+                    self._pipeline.set_external_context_provider(
+                        self._scanner_integration.get_symbol_context
+                    )
+                    logger.info("Pipeline wired to Scanner Integration (context augmentation enabled)")
 
         except Exception as e:
             logger.error(f"Failed to initialize scanner: {e}")
@@ -616,6 +643,57 @@ class MorpheusServer:
 
         except Exception as e:
             logger.error(f"Error activating watchlist symbol: {e}")
+
+    async def _handle_scanner_event(self, event: Event) -> None:
+        """
+        Handle events from Scanner Integration.
+
+        These are mapped scanner events (MARKET_HALT, MARKET_RESUME, SCANNER_*).
+        They are emitted to the Morpheus event stream for UI and strategies.
+        """
+        try:
+            # Emit to WebSocket clients
+            await self.emit_event(event)
+            logger.info(f"[SCANNER_EVENT] {event.event_type.value}: {event.symbol}")
+        except Exception as e:
+            logger.error(f"Error handling scanner event: {e}")
+
+    async def _handle_scanner_symbol_discovered(self, symbol: str) -> None:
+        """
+        Handle new symbol discovered by Scanner Integration.
+
+        This is the ONLY path for symbols to enter the pipeline.
+        Scanner is the eyes - Morpheus is the brain.
+        """
+        try:
+            logger.info(f"[SCANNER] Symbol discovered: {symbol}")
+
+            # Add to subscribed symbols
+            self.state.subscribed_symbols.add(symbol)
+
+            # Subscribe to streaming quotes
+            if self._streamer_available and self._use_streaming and self._streamer:
+                await self._streamer.subscribe_quotes([symbol])
+                logger.info(f"[SCANNER] Subscribed to streaming: {symbol}")
+
+            # Add to signal pipeline
+            if self._pipeline_available and self._pipeline:
+                self._pipeline.add_symbol(symbol)
+                # Warmup with historical data
+                asyncio.create_task(self._warmup_pipeline_symbol(symbol))
+                logger.info(f"[SCANNER] Added to pipeline: {symbol}")
+
+        except Exception as e:
+            logger.error(f"Error handling discovered symbol {symbol}: {e}")
+
+    async def _handle_scanner_symbol_removed(self, symbol: str) -> None:
+        """Handle symbol removed from scanner universe."""
+        try:
+            logger.info(f"[SCANNER] Symbol removed from scanner: {symbol}")
+            # Note: We don't immediately remove from pipeline/streaming
+            # Let the symbol naturally expire from watchlist if not active
+        except Exception as e:
+            logger.error(f"Error handling removed symbol {symbol}: {e}")
 
     async def _handle_aggregated_candle(self, symbol: str, ohlcv: OHLCV, timestamp: datetime) -> None:
         """Handle completed 1-min candle from aggregator."""
@@ -935,6 +1013,10 @@ class MorpheusServer:
                 await self._watchlist.start()
             if self._scanner:
                 await self._scanner.start()
+            # Start scanner integration (event mapping, halt tracking)
+            if hasattr(self, '_scanner_integration') and self._scanner_integration:
+                await self._scanner_integration.start()
+                logger.info("Scanner Integration started (events + halts)")
             logger.info("Scanner started (auto-discovery enabled)")
 
         # Emit system start event
@@ -954,6 +1036,10 @@ class MorpheusServer:
 
     async def stop(self):
         """Stop background tasks."""
+        # Stop scanner integration
+        if hasattr(self, '_scanner_integration') and self._scanner_integration:
+            await self._scanner_integration.stop()
+
         # Stop scanner and watchlist
         if self._scanner:
             await self._scanner.stop()

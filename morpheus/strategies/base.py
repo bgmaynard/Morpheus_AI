@@ -24,6 +24,7 @@ from enum import Enum
 from typing import Any
 
 from morpheus.core.events import Event, EventType, create_event
+from morpheus.core.market_mode import MarketMode, get_market_mode
 from morpheus.data.market_snapshot import MarketSnapshot
 from morpheus.features.feature_engine import FeatureContext
 
@@ -40,6 +41,13 @@ class SignalDirection(Enum):
 SIGNAL_SCHEMA_VERSION = "1.0"
 
 
+class SignalMode(Enum):
+    """Signal actionability mode based on market session."""
+
+    ACTIVE = "ACTIVE"  # Signal is actionable (within active trading window)
+    OBSERVED = "OBSERVED"  # Signal is logged but not actionable
+
+
 @dataclass(frozen=True)
 class SignalCandidate:
     """
@@ -50,6 +58,7 @@ class SignalCandidate:
     - Strategy that generated it
     - Supporting context (regime, features)
     - Optional reference levels
+    - Market mode context for audit trail
 
     Immutable to ensure determinism.
     Does NOT contain:
@@ -84,6 +93,11 @@ class SignalCandidate:
     invalidation_reference: float | None = None
     target_reference: float | None = None
 
+    # Market mode context (for audit trail)
+    market_mode: str = ""  # "PREMARKET", "RTH", "OFFHOURS"
+    signal_mode: SignalMode = SignalMode.OBSERVED  # ACTIVE or OBSERVED
+    time_et: str = ""  # ET timestamp for logging
+
     def to_event_payload(self) -> dict[str, Any]:
         """Convert to event payload dict."""
         return {
@@ -100,12 +114,22 @@ class SignalCandidate:
             "entry_reference": self.entry_reference,
             "invalidation_reference": self.invalidation_reference,
             "target_reference": self.target_reference,
+            # Market mode context (mandatory for audit)
+            "market_mode": self.market_mode,
+            "signal_mode": self.signal_mode.value,
+            "time_et": self.time_et,
         }
 
     def to_event(self) -> Event:
-        """Create a SIGNAL_CANDIDATE event."""
+        """Create a SIGNAL_CANDIDATE or SIGNAL_OBSERVED event based on mode."""
+        # Use SIGNAL_OBSERVED for observe-only signals
+        event_type = (
+            EventType.SIGNAL_OBSERVED
+            if self.signal_mode == SignalMode.OBSERVED
+            else EventType.SIGNAL_CANDIDATE
+        )
         return create_event(
-            EventType.SIGNAL_CANDIDATE,
+            event_type,
             payload=self.to_event_payload(),
             symbol=self.symbol,
             timestamp=self.timestamp,
@@ -131,6 +155,9 @@ class StrategyContext:
 
     # From strategy router (Phase 3)
     allowed_strategies: tuple[str, ...] = field(default_factory=tuple)
+
+    # Market mode context (for strategy filtering and event tagging)
+    market_mode: MarketMode | None = None
 
 
 class Strategy(ABC):
@@ -170,6 +197,19 @@ class Strategy(ABC):
         """Regime patterns this strategy is designed for (empty = all)."""
         return ()
 
+    @property
+    def allowed_market_modes(self) -> frozenset[str]:
+        """
+        Market modes where this strategy is allowed to generate signals.
+
+        Default: RTH only (Regular Trading Hours).
+        Override to include "PREMARKET" for premarket-safe strategies.
+
+        Returns:
+            frozenset of allowed mode names ("PREMARKET", "RTH", "OFFHOURS")
+        """
+        return frozenset({"RTH"})
+
     def can_evaluate(self, context: StrategyContext) -> bool:
         """
         Check if strategy can evaluate given the context.
@@ -178,7 +218,13 @@ class Strategy(ABC):
         - Required features are missing
         - Strategy not in allowed list
         - Regime is incompatible
+        - Market mode not allowed for this strategy
         """
+        # Check market mode first (safety gate)
+        if context.market_mode:
+            if context.market_mode.name not in self.allowed_market_modes:
+                return False
+
         # Check if strategy is allowed by router
         if context.allowed_strategies and self.name not in context.allowed_strategies:
             return False
@@ -245,6 +291,12 @@ class Strategy(ABC):
         Returns:
             SignalCandidate with all fields populated
         """
+        from morpheus.core.market_mode import get_time_et
+
+        # Determine market mode and signal mode
+        mode = context.market_mode or get_market_mode()
+        signal_mode = SignalMode.ACTIVE if mode.active_trading else SignalMode.OBSERVED
+
         return SignalCandidate(
             schema_version=SIGNAL_SCHEMA_VERSION,
             symbol=context.symbol,
@@ -259,6 +311,10 @@ class Strategy(ABC):
             entry_reference=entry_reference,
             invalidation_reference=invalidation_reference,
             target_reference=target_reference,
+            # Market mode context
+            market_mode=mode.name,
+            signal_mode=signal_mode,
+            time_et=get_time_et(),
         )
 
     def create_no_signal(self, context: StrategyContext) -> SignalCandidate:
@@ -271,6 +327,10 @@ class Strategy(ABC):
         Returns:
             SignalCandidate with direction=NONE
         """
+        from morpheus.core.market_mode import get_time_et
+
+        mode = context.market_mode or get_market_mode()
+
         return SignalCandidate(
             schema_version=SIGNAL_SCHEMA_VERSION,
             symbol=context.symbol,
@@ -279,7 +339,15 @@ class Strategy(ABC):
             timestamp=context.snapshot.timestamp,
             regime=context.features.regime or "",
             regime_confidence=context.features.regime_confidence,
+            market_mode=mode.name,
+            signal_mode=SignalMode.OBSERVED,  # No-signals are always observed
+            time_et=get_time_et(),
         )
+
+
+import logging
+
+_logger = logging.getLogger(__name__)
 
 
 class StrategyRunner:
@@ -313,9 +381,23 @@ class StrategyRunner:
         """Get registered strategies."""
         return list(self._strategies)
 
+    def get_strategies_for_mode(self, market_mode: str) -> list[Strategy]:
+        """
+        Get strategies allowed for a specific market mode.
+
+        Args:
+            market_mode: "PREMARKET", "RTH", or "OFFHOURS"
+
+        Returns:
+            List of strategies allowed in that mode
+        """
+        return [s for s in self._strategies if market_mode in s.allowed_market_modes]
+
     def run(self, context: StrategyContext) -> list[SignalCandidate]:
         """
         Run all eligible strategies and collect signal candidates.
+
+        Filters strategies by market mode, features, regime, etc.
 
         Args:
             context: StrategyContext with all inputs
@@ -325,11 +407,19 @@ class StrategyRunner:
             (includes NONE signals for completeness)
         """
         signals: list[SignalCandidate] = []
+        mode_name = context.market_mode.name if context.market_mode else "UNKNOWN"
 
         for strategy in self._strategies:
             if strategy.can_evaluate(context):
                 signal = strategy.evaluate(context)
                 signals.append(signal)
+            else:
+                # Log why strategy was filtered (for debugging)
+                if context.market_mode and context.market_mode.name not in strategy.allowed_market_modes:
+                    _logger.debug(
+                        f"[STRATEGY] {strategy.name} filtered: not allowed in {mode_name} "
+                        f"(allowed: {strategy.allowed_market_modes})"
+                    )
 
         return signals
 

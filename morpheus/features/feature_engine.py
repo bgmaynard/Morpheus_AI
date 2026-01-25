@@ -91,6 +91,11 @@ class FeatureContext:
     # Allowed strategies (set by StrategyRouter)
     allowed_strategies: tuple[str, ...] = field(default_factory=tuple)
 
+    # External context (set by Scanner Integration - READ ONLY)
+    # Contains scanner_score, gap_pct, halt_status, rvol_proxy, etc.
+    # Strategies may reference but NOT mutate these values
+    external: dict[str, Any] = field(default_factory=dict)
+
     # Metadata
     bars_available: int = 0
     warmup_complete: bool = False
@@ -106,6 +111,7 @@ class FeatureContext:
             "regime_confidence": self.regime_confidence,
             "regime_components": self.regime_components,
             "allowed_strategies": list(self.allowed_strategies),
+            "external": self.external,  # Scanner context (read-only)
             "bars_available": self.bars_available,
             "warmup_complete": self.warmup_complete,
         }

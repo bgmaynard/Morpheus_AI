@@ -25,10 +25,12 @@ from decimal import Decimal
 from typing import Any, Callable, Awaitable
 
 from morpheus.core.events import Event, EventType, create_event
+from morpheus.core.market_mode import MarketMode, get_market_mode, get_time_et
 
 # Features & Regime
 from morpheus.features.feature_engine import FeatureEngine, FeatureContext
 from morpheus.features.indicators import OHLCV
+from morpheus.integrations.max_ai_scanner import update_feature_context_with_external
 from morpheus.regime.regime_detector import (
     RegimeDetector,
     RegimeClassification,
@@ -47,9 +49,11 @@ from morpheus.strategies.base import (
     StrategyContext,
     SignalCandidate,
     SignalDirection,
+    SignalMode,
 )
 from morpheus.strategies.momentum import get_momentum_strategies
 from morpheus.strategies.mean_reversion import get_mean_reversion_strategies
+from morpheus.strategies.premarket_observer import get_premarket_strategies
 
 # Scoring & Gate
 from morpheus.scoring.base import Scorer, ScoredSignal, GateResult, GateDecision
@@ -164,6 +168,7 @@ class SignalPipeline:
         self,
         config: PipelineConfig | None = None,
         emit_event: Callable[[Event], Awaitable[None]] | None = None,
+        external_context_provider: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
     ):
         """
         Initialize the signal pipeline.
@@ -171,9 +176,12 @@ class SignalPipeline:
         Args:
             config: Pipeline configuration
             emit_event: Async callback to emit events (for server integration)
+            external_context_provider: Async callback to fetch external context for a symbol
+                                       (e.g., from MAX_AI_SCANNER for scanner_score, gap_pct, etc.)
         """
         self.config = config or PipelineConfig()
         self._emit_event = emit_event
+        self._external_context_provider = external_context_provider
         self._state = PipelineState()
 
         # Initialize components
@@ -235,18 +243,31 @@ class SignalPipeline:
 
     def _register_strategies(self) -> None:
         """Register all available strategies."""
-        # Momentum strategies
+        # Premarket observer strategies (PREMARKET mode only, OBSERVE-only)
+        for strategy in get_premarket_strategies():
+            self._strategy_runner.register(strategy)
+            logger.debug(
+                f"[PIPELINE] Registered strategy: {strategy.name} "
+                f"(modes: {strategy.allowed_market_modes})"
+            )
+
+        # Momentum strategies (RTH mode only)
         for strategy in get_momentum_strategies():
             self._strategy_runner.register(strategy)
             logger.debug(f"[PIPELINE] Registered strategy: {strategy.name}")
 
-        # Mean reversion strategies
+        # Mean reversion strategies (RTH mode only)
         for strategy in get_mean_reversion_strategies():
             self._strategy_runner.register(strategy)
             logger.debug(f"[PIPELINE] Registered strategy: {strategy.name}")
 
+        # Log summary by mode
+        premarket_strategies = self._strategy_runner.get_strategies_for_mode("PREMARKET")
+        rth_strategies = self._strategy_runner.get_strategies_for_mode("RTH")
+
         logger.info(
-            f"[PIPELINE] Registered {len(self._strategy_runner.strategies)} strategies"
+            f"[PIPELINE] Registered {len(self._strategy_runner.strategies)} strategies: "
+            f"{len(premarket_strategies)} for PREMARKET, {len(rth_strategies)} for RTH"
         )
 
     async def _emit(self, event: Event) -> None:
@@ -278,6 +299,23 @@ class SignalPipeline:
         """Set kill switch state."""
         self._state.kill_switch_active = active
         logger.warning(f"[PIPELINE] Kill switch {'ACTIVATED' if active else 'deactivated'}")
+
+    def set_external_context_provider(
+        self,
+        provider: Callable[[str], Awaitable[dict[str, Any]]] | None,
+    ) -> None:
+        """
+        Set the external context provider for scanner augmentation.
+
+        This allows the server to wire the scanner integration after initialization.
+        The provider should return scanner context dict for a given symbol.
+
+        Args:
+            provider: Async callable that takes a symbol and returns context dict
+        """
+        self._external_context_provider = provider
+        if provider:
+            logger.info("[PIPELINE] External context provider set (scanner augmentation enabled)")
 
     def is_kill_switch_active(self) -> bool:
         """Check if kill switch is active."""
@@ -408,18 +446,45 @@ class SignalPipeline:
         Run the full pipeline for a symbol.
 
         Stages:
+        0. Get market mode (trading window gate)
         1. Compute features
         2. Detect regime
         3. Route strategies
-        4. Generate signals
+        4. Generate signals (filtered by market mode)
         5. Score signals
         6. Gate signals
         7. Evaluate risk
-        8. Emit events
+        8. Emit events (ACTIVE vs OBSERVED based on mode)
         """
         try:
+            # Stage 0: Get market mode (trading window gate)
+            market_mode = get_market_mode()
+            time_et = get_time_et()
+
+            logger.debug(
+                f"[PIPELINE] {symbol} mode={market_mode.name} "
+                f"active_trading={market_mode.active_trading} time_et={time_et}"
+            )
+
             # Stage 1: Compute features
             feature_context = self._feature_engine.compute_features(symbol, snapshot)
+
+            # Stage 1.5: Augment with external context (from Scanner)
+            # This is READ-ONLY data - strategies may reference but NOT recompute
+            if self._external_context_provider:
+                try:
+                    external_data = await self._external_context_provider(symbol)
+                    if external_data:
+                        feature_context = update_feature_context_with_external(
+                            feature_context, external_data
+                        )
+                        logger.debug(
+                            f"[PIPELINE] {symbol} augmented with scanner context: "
+                            f"score={external_data.get('scanner_score', 0)}"
+                        )
+                except Exception as e:
+                    logger.warning(f"[PIPELINE] Failed to fetch external context for {symbol}: {e}")
+
             await self._emit(feature_context.to_event())
 
             # Stage 2: Detect regime
@@ -438,12 +503,19 @@ class SignalPipeline:
             routing = self._strategy_router.route(regime)
             feature_context = update_feature_context_with_strategies(feature_context, routing)
 
-            # Stage 4: Generate signals
+            # Stage 4: Generate signals (filtered by market mode)
             strategy_context = StrategyContext(
                 symbol=symbol,
                 snapshot=snapshot,
                 features=feature_context,
                 allowed_strategies=feature_context.allowed_strategies,
+                market_mode=market_mode,  # Inject market mode for filtering
+            )
+
+            # Log how many strategies are available for this mode
+            eligible_strategies = self._strategy_runner.get_strategies_for_mode(market_mode.name)
+            logger.debug(
+                f"[PIPELINE] {symbol} {len(eligible_strategies)} strategies eligible in {market_mode.name}"
             )
 
             signals = self._strategy_runner.run_actionable(strategy_context)
@@ -464,24 +536,40 @@ class SignalPipeline:
         """
         Process a signal through scoring, gating, and risk evaluation.
 
+        Respects signal_mode: ACTIVE signals go through full pipeline,
+        OBSERVED signals are logged but not processed for execution.
+
         Args:
             signal: Generated signal candidate
             features: Feature context
             snapshot: Current market snapshot
         """
         symbol = signal.symbol
+        is_observed = signal.signal_mode == SignalMode.OBSERVED
 
         # Check signal cooldown (avoid duplicate signals)
         if not self._check_signal_cooldown(signal):
             logger.debug(f"[PIPELINE] {symbol} signal in cooldown, skipping")
             return
 
-        # Emit SIGNAL_CANDIDATE
+        # Emit SIGNAL_CANDIDATE (includes market_mode, signal_mode, time_et)
         await self._emit(signal.to_event())
+
+        # Log with mode context
+        mode_tag = "[OBSERVED]" if is_observed else "[ACTIVE]"
         logger.info(
-            f"[PIPELINE] Signal: {symbol} {signal.direction.value} "
-            f"from {signal.strategy_name} - {signal.rationale}"
+            f"[PIPELINE] {mode_tag} Signal: {symbol} {signal.direction.value} "
+            f"from {signal.strategy_name} @ {signal.time_et} - {signal.rationale}"
         )
+
+        # OBSERVED signals are logged but not processed further
+        # They will appear in UI but not as actionable
+        if is_observed:
+            logger.info(
+                f"[PIPELINE] {symbol} signal is OBSERVED (mode={signal.market_mode}) - "
+                "skipping scoring/gate/risk"
+            )
+            return
 
         # Stage 5: Score the signal
         scored_signal = self._scorer.score(signal, features)
@@ -641,11 +729,25 @@ class SignalPipeline:
 
     def get_status(self) -> dict[str, Any]:
         """Get pipeline status for diagnostics."""
+        # Get current market mode
+        market_mode = get_market_mode()
+        time_et = get_time_et()
+
+        # Get strategies eligible for current mode
+        strategies_for_mode = self._strategy_runner.get_strategies_for_mode(market_mode.name)
+
         return {
+            # Market mode status (required for UI display)
+            "market_mode": market_mode.name,
+            "active_trading": market_mode.active_trading,
+            "observe_only": market_mode.observe_only,
+            "time_et": time_et,
+            # Strategies
             "active_symbols": list(self._state.active_symbols),
             "kill_switch_active": self._state.kill_switch_active,
             "permissive_mode": self.config.permissive_mode,
             "registered_strategies": [s.name for s in self._strategy_runner.strategies],
+            "strategies_for_current_mode": [s.name for s in strategies_for_mode],
             "warmup_status": {
                 symbol: {
                     "bars": self._feature_engine.bars_available(symbol),
