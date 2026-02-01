@@ -19,36 +19,53 @@ The human reads tape in Thinkorswim, sees signals in Morpheus UI, confirms entri
 ### Directory Structure
 ```
 morpheus/
-├── ai/          # ML models, scoring
-├── broker/      # Schwab integration
-├── core/        # Core types, config
-├── data/        # Market data handlers
-├── execution/   # Order execution
-├── features/    # Feature engineering
-├── regime/      # Market regime detection
-├── risk/        # Risk management, position sizing
-├── scoring/     # Signal scoring
-├── server/      # FastAPI server, WebSocket
-├── services/    # Background services
-└── strategies/  # Trading strategies
+├── ai/            # ML models, scoring
+├── broker/        # Schwab integration
+├── classify/      # MASS strategy classifier (routing matrix)
+├── core/          # Core types, config, mass_config
+├── data/          # Market data handlers
+├── evolve/        # MASS performance tracking, weight adaptation
+├── execution/     # Order execution
+├── features/      # Feature engineering
+├── integrations/  # MAX_AI_SCANNER integration
+├── orchestrator/  # Signal pipeline (central coordinator)
+├── regime/        # Market regime detection + MASS regime mapping
+├── risk/          # Risk management, position sizing, MASS risk governor
+├── scoring/       # Signal scoring, meta-gates
+├── server/        # FastAPI server, WebSocket (monolith mode)
+├── services/      # Background services
+├── spine/         # NATS Data Spine (multi-process architecture)
+├── strategies/    # Trading strategies (original + 7 MASS strategies)
+├── structure/     # MASS structure analyzer (A/B/C grading)
+└── supervise/     # MASS AI supervisor (decay detection)
 ```
 
 ### Key Endpoints
 - `GET /api/market/status` - Market data availability
 - `GET /api/market/candles/{symbol}` - OHLCV candle data
 - `GET /api/market/quotes` - Real-time quotes
+- `GET /api/pipeline/status` - Pipeline diagnostics + MASS status
 - `POST /api/trading/confirm-entry` - Human confirms signal
 - `POST /api/trading/cancel-order` - Cancel order
+- `GET /api/mass/status` - MASS system status (regime, classifier, supervisor)
+- `GET /api/mass/performance` - Per-strategy performance metrics
+- `GET /api/mass/weights` - Current strategy weights
+- `POST /api/mass/supervisor/check` - Trigger AI supervisor health check
 - `WS /ws/events` - Real-time event stream
 
 ### Event Types
 - `REGIME_DETECTED` - Market regime change
+- `STRUCTURE_CLASSIFIED` - MASS structure grade assigned (A/B/C)
+- `STRATEGY_ASSIGNED` - MASS classifier routing result
 - `SIGNAL_CANDIDATE` - New trading signal
 - `SIGNAL_SCORED` - AI confidence score
 - `META_APPROVED/REJECTED` - Gate decision
 - `RISK_APPROVED/VETO` - Risk check result
 - `ORDER_SUBMITTED/CONFIRMED/FILL_RECEIVED` - Order lifecycle
 - `POSITION_UPDATE` - Position changes
+- `SUPERVISOR_ALERT` - AI supervisor warning/critical alert
+- `FEEDBACK_UPDATE` - Trade outcome recorded
+- `STRATEGY_WEIGHT_ADJUSTED` - Strategy weight changed
 
 ### Running
 ```bash
@@ -154,11 +171,102 @@ Events come through with structure:
 
 ---
 
+### NATS Data Spine (2026-01-31)
+Multi-process architecture replacing monolith HTTP polling with NATS pub/sub.
+
+**Problem Solved:**
+- 25,496 scanner HTTP calls/36min → ~4/min (15s intervals via NATS)
+- 424 Schwab position polls → event-driven via NATS
+- Single-process bottleneck → 5 isolated processes
+
+**Architecture:**
+```
+Schwab Feed → NATS → AI Core → NATS → UI Gateway → Morpheus_UI
+Scanner Feed → NATS ↗                    ↗ Replay Logger
+```
+
+**Spine Directory (`morpheus/spine/`):**
+```
+├── __init__.py          # Package docstring
+├── __main__.py          # python -m morpheus.spine
+├── schemas.py           # MsgPack message types (QuoteMsg, OHLCMsg, etc.)
+├── nats_client.py       # Async NATS wrapper with auto-reconnect
+├── config_store.py      # File-backed spine_config.json
+├── schwab_feed.py       # Service 1: Schwab WebSocket → NATS
+├── scanner_feed.py      # Service 2: MAX_AI_SCANNER → NATS (interval-based)
+├── ai_core.py           # Service 3: NATS → MASS Pipeline → NATS
+├── ui_gateway.py        # Service 4: NATS → REST/WebSocket (backward compat)
+├── replay_logger.py     # Service 5: NATS → JSONL logs
+├── launcher.py          # Process orchestrator
+└── spine_config.json    # Configuration
+```
+
+**NATS Topics:**
+| Topic | Lane | Description |
+|-------|------|-------------|
+| md.quotes.{sym} | Firehose | Real-time quote ticks |
+| md.ohlc.1m.{sym} | Aggregated (1hr) | 1-minute OHLCV bars |
+| scanner.context.{sym} | Aggregated (1hr) | Scanner context (every 15s) |
+| scanner.alerts | Firehose | Trading halts |
+| scanner.discovery | Firehose | New symbol discoveries |
+| ai.signals.{sym} | Decisions (24hr) | Trading signals |
+| ai.structure.{sym} | Decisions (24hr) | MASS structure grades |
+| ai.regime | Decisions (24hr) | Regime changes |
+| bot.telemetry.{svc} | Decisions (24hr) | Service health |
+| bot.positions | Decisions (24hr) | Position updates |
+
+**Running (Spine Mode):**
+```bash
+# Prerequisites: NATS server + nats-py + msgpack
+choco install nats-server    # or download from nats.io
+pip install nats-py msgpack
+
+# Start everything (NATS + 5 services)
+cd C:\Morpheus\Morpheus_AI
+.\start_spine.ps1
+
+# Or manually:
+nats-server -js -m 8222     # Start NATS with JetStream
+python -m morpheus.spine     # Start all services
+
+# Start specific services only:
+python -m morpheus.spine.launcher --services schwab_feed,ai_core,ui_gateway
+```
+
+**Running (Monolith Mode - unchanged):**
+```bash
+cd C:\Morpheus\Morpheus_AI
+python -m morpheus.server.main
+```
+
+**Ports:**
+- Monolith server: port 8010 (default)
+- Spine UI Gateway: port 8011 (can run simultaneously with monolith)
+- NATS server: port 4222
+- UI connects to port via `VITE_API_PORT` env var (defaults to 8010)
+
+**Running UI Against Spine:**
+```bash
+cd C:\Morpheus\Morpheus_UI
+copy .env.spine .env.local   # Sets VITE_API_PORT=8011
+npm run dev
+```
+
+**Backward Compatibility:**
+- UI Gateway serves identical REST/WebSocket API (same endpoints as monolith)
+- Monolith and spine can run simultaneously on different ports
+- Monolith server still works independently on port 8010
+
+---
+
 ## Next Steps / Ideas
-- Add more indicators (Bollinger Bands, RSI)
 - Indicator toggle UI
 - Alert system for signals
 - Position sync from Schwab (sync existing positions from TOS)
+- MASS Phase 3: AI supervisor reinforcement learning
+- MASS Phase 4: Cross-market adaptation, multi-asset support
+- Replace StubScorer with ML-based scorer
+- UI panel for MASS status/performance/weights
 
 ## Completed Fixes
 
@@ -237,3 +345,96 @@ Classifies premarket behavior without generating actionable signals:
 - GAP_DOWN_HOLDING, GAP_DOWN_RECOVERING
 - FLAT_CONSOLIDATING, HIGH_VOLATILITY
 - Emits tags: structure:*, gap:*, volume:*, scanner:*
+
+### MASS v1.0 - Morpheus Adaptive Strategy System (2026-01-31)
+Full adaptive multi-strategy trading system implementation.
+
+**Architecture:**
+```
+Scanner → Structure → Classifier → Regime → Strategies → Scoring → Gate → Risk → Human Confirm
+```
+
+**Pipeline stages added to `morpheus/orchestrator/pipeline.py`:**
+- Stage 2.3: MASS Regime Mapping (HOT/NORMAL/CHOP/DEAD)
+- Stage 2.5: Structure Analysis (A/B/C quality grading)
+- Stage 2.7: Strategy Classification (routes to optimal strategy)
+- Backward compatible: `MASSConfig(enabled=False)` falls back to original StrategyRouter
+
+**Phase 1 - Structure + Classifier + Strategies:**
+
+*Structure Analyzer (`morpheus/structure/`):*
+- Grades symbols A/B/C based on 100-point rubric
+- Scoring: VWAP position (20), EMA stacking (20), trend slope (15), S/R proximity (15), liquidity (15), volume (15)
+- A >= 75, B >= 50, C < 50
+- C-grade symbols filtered out by classifier
+
+*Strategy Classifier (`morpheus/classify/`):*
+- Routes symbols to optimal strategy based on structure + regime + scanner context
+- Each strategy scored 0-1 for fit; top N assigned (default max 2)
+- Configurable weights per strategy via `ClassifierConfig`
+- Mode-aware: only PMB + CAT in PREMARKET, all others in RTH
+
+*7 New MASS Strategies (`morpheus/strategies/`):*
+| Code | Strategy | File | Mode | Direction | Key Conditions |
+|------|----------|------|------|-----------|----------------|
+| PMB | Premarket Breakout | `premarket_breakout.py` | PREMARKET | LONG | Gap>3%, above VWAP, RVOL>2x, RSI 50-75 |
+| CAT | Catalyst Momentum | `catalyst_momentum.py` | RTH+PM | LONG | Scanner>70, RVOL>3x, bullish EMA stack |
+| D2 | Day-2 Continuation | `day2_continuation.py` | RTH | LONG | Gap holding, above VWAP, RSI 45-65 |
+| COIL | Coil Breakout | `coil_breakout.py` | RTH | LONG | BB squeeze, low vol, volume expanding |
+| SQZ | Short Squeeze | `short_squeeze.py` | RTH | LONG | RVOL>4x, RSI>60, bullish stack |
+| FADE | Gap Fade | `gap_fade.py` | RTH | SHORT | Gap>5% fading, below VWAP, MACD neg |
+| SCALP | Order Flow Scalp | `order_flow_scalp.py` | RTH | LONG/SHORT | Spread<0.2%, RVOL>2x, micro-trend |
+
+All strategies conform to existing `Strategy` ABC in `morpheus/strategies/base.py`.
+Aggregated via `get_mass_strategies()` in `mass_strategies.py`.
+
+*Configuration (`morpheus/core/mass_config.py`):*
+```python
+MASSConfig(
+    enabled=True,          # Master switch
+    structure=StructureConfig(),
+    classifier=ClassifierConfig(),
+    strategy_risk_overrides={...},  # Per-strategy risk %
+    regime_mapping_enabled=False,   # Phase 2 flag
+    feedback_enabled=False,         # Phase 2 flag
+    supervisor_enabled=False,       # Phase 2 flag
+)
+```
+
+**Phase 2 - Regime + Risk + Feedback + Supervisor:**
+
+*MASS Regime Mapper (`morpheus/regime/mass_regime.py`):*
+- Maps existing 3-component regime to MASS modes
+- HOT: trending + high vol + strong momentum → aggression 1.5x, max 5 positions
+- NORMAL: trending + normal vol → aggression 1.0x, max 3
+- CHOP: ranging + neutral → aggression 0.7x, max 2
+- DEAD: low vol + ranging + neutral → aggression 0.5x, no trading
+
+*MASS Risk Governor (`morpheus/risk/mass_risk_governor.py`):*
+- Wraps existing risk chain: MASS → RoomToProfit → StandardRisk
+- Per-trade risk: 0.25% (vs standard 1%)
+- Daily loss limit: 1.5%
+- Symbol cooldown: 15 minutes between signals
+- Regime-based position count caps
+- 3 new VetoReasons: SYMBOL_COOLDOWN, REGIME_POSITION_LIMIT, STRATEGY_RISK_EXCEEDED
+
+*Performance Tracking (`morpheus/evolve/`):*
+- `PerformanceTracker`: records TradeOutcome to JSONL, computes win rate/expectancy/PF per strategy
+- `StrategyWeightManager`: auto-adjusts weights [0.3, 2.0] based on win rate, profit factor, loss streaks
+- Pushes updated weights to classifier
+
+*AI Supervisor (`morpheus/supervise/`):*
+- Detects strategy decay (win rate drop >15% from baseline)
+- Detects loss streaks (5+ consecutive losses)
+- Detects low profit factor (<0.8)
+- Auto-actions: reduce weight on warning, near-disable on critical
+- Emits SUPERVISOR_ALERT events
+
+**FeatureContext additions:**
+- `structure_grade: str` (A/B/C)
+- `structure_score: float` (0-100)
+- `structure_data: dict` (full structure breakdown)
+- Helper: `update_feature_context_with_structure()`
+
+**11 total registered strategies:**
+4 original (PremarketStructureObserver, FirstPullback, HODContinuation, VWAPReclaim) + 7 MASS

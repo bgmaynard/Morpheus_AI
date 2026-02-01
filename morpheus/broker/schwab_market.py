@@ -62,6 +62,9 @@ class QuoteData:
     quote_time: datetime
     is_tradeable: bool
     is_market_open: bool
+    close_price: float = 0.0
+    net_change: float = 0.0
+    net_change_percent: float = 0.0
 
     @classmethod
     def from_schwab_response(cls, symbol: str, data: dict[str, Any]) -> QuoteData:
@@ -77,6 +80,11 @@ class QuoteData:
         else:
             quote_time = datetime.now(timezone.utc)
 
+        # Get close price and calculate change
+        close_price = float(quote.get("closePrice", 0.0))
+        net_change = float(quote.get("netChange", 0.0))
+        net_change_percent = float(quote.get("netPercentChange", 0.0))
+
         return cls(
             symbol=symbol,
             bid_price=float(quote.get("bidPrice", 0.0)),
@@ -86,6 +94,9 @@ class QuoteData:
             quote_time=quote_time,
             is_tradeable=quote.get("securityStatus", "Normal") == "Normal",
             is_market_open=quote.get("isMarketOpen", True),
+            close_price=close_price,
+            net_change=net_change,
+            net_change_percent=net_change_percent,
         )
 
 

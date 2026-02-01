@@ -1,0 +1,32 @@
+{
+  "nats_url": "nats://localhost:4222",
+  "services": {
+    "schwab_feed": { "enabled": true, "cpu_affinity": [0, 1] },
+    "scanner_feed": { "enabled": true, "cpu_affinity": [2, 3] },
+    "ai_core": { "enabled": true, "cpu_affinity": [4, 5, 6, 7] },
+    "ui_gateway": { "enabled": true, "cpu_affinity": [8, 9] },
+    "replay_logger": { "enabled": true, "cpu_affinity": [10, 11] }
+  },
+  "scanner": {
+    "context_refresh_seconds": 15,
+    "discovery_interval_seconds": 30,
+    "halt_interval_seconds": 10
+  },
+  "ui": {
+    "quote_throttle_hz": 10,
+    "max_active_symbols": 50
+  },
+  "positions": {
+    "poll_interval_market_open": 5,
+    "poll_interval_market_closed": 60
+  },
+  "replay": {
+    "log_dir": "logs/spine",
+    "flush_interval_seconds": 1.0
+  },
+  "pipeline": {
+    "min_bars_warmup": 50,
+    "max_bars_history": 200,
+    "permissive_mode": true
+  }
+}
