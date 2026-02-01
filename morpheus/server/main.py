@@ -1630,6 +1630,15 @@ def create_app() -> FastAPI:
             pipeline_enabled=server._pipeline_available,
         )
 
+    @app.get("/api/time/status")
+    async def time_authority_status():
+        """Market Time Authority - single source of truth for all time."""
+        try:
+            from morpheus.core.time_authority import get_time_authority
+            return get_time_authority().get_status()
+        except ImportError:
+            return {"error": "TimeAuthority not available", "fallback": "system_clock"}
+
     @app.get("/api/ui/state")
     async def get_state():
         """Get current state for UI initialization."""

@@ -16,6 +16,19 @@ from morpheus.core.market_mode import (
     RTH,
     OFFHOURS,
 )
+from morpheus.core.time_authority import (
+    TimeAuthority,
+    get_time_authority,
+    now,
+    now_utc,
+    now_iso,
+    now_utc_iso,
+    now_time,
+    now_hhmm,
+    source,
+    drift_ms,
+    is_drift_safe,
+)
 
 __all__ = [
     "Event",
@@ -38,4 +51,16 @@ __all__ = [
     "PREMARKET",
     "RTH",
     "OFFHOURS",
+    # Time authority
+    "TimeAuthority",
+    "get_time_authority",
+    "now",
+    "now_utc",
+    "now_iso",
+    "now_utc_iso",
+    "now_time",
+    "now_hhmm",
+    "source",
+    "drift_ms",
+    "is_drift_safe",
 ]

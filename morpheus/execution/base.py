@@ -73,6 +73,9 @@ class BlockReason(Enum):
     SYMBOL_MISMATCH = "symbol_mismatch"
     KILL_SWITCH_ACTIVE = "kill_switch_active"
 
+    # Time authority
+    TIME_DRIFT_UNSAFE = "time_drift_unsafe"
+
 
 class OrderType(Enum):
     """Order types supported."""

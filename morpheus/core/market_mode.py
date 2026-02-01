@@ -66,7 +66,11 @@ def get_market_mode(now: datetime | None = None) -> MarketMode:
         MarketMode indicating current session state
     """
     if now is None:
-        now = datetime.now(ET)
+        try:
+            from morpheus.core.time_authority import get_time_authority
+            now = get_time_authority().now()
+        except ImportError:
+            now = datetime.now(ET)
     elif now.tzinfo is None:
         # Assume naive datetime is in ET
         now = now.replace(tzinfo=ET)
@@ -102,7 +106,11 @@ def get_time_et(now: datetime | None = None) -> str:
         ISO format string in ET timezone
     """
     if now is None:
-        now = datetime.now(ET)
+        try:
+            from morpheus.core.time_authority import get_time_authority
+            now = get_time_authority().now()
+        except ImportError:
+            now = datetime.now(ET)
     elif now.tzinfo is None:
         now = now.replace(tzinfo=ET)
     else:

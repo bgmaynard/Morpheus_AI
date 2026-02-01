@@ -122,6 +122,18 @@ class StandardExecutionGuard(ExecutionGuard):
             reasons.append(BlockReason.MARKET_CLOSED)
             details_parts.append("Market is closed")
 
+        # Check 1b: Time drift safety
+        try:
+            from morpheus.core.time_authority import get_time_authority
+            ta = get_time_authority()
+            if not ta.is_drift_safe():
+                reasons.append(BlockReason.TIME_DRIFT_UNSAFE)
+                details_parts.append(
+                    f"Time drift {ta.drift_ms():.0f}ms exceeds 1000ms threshold"
+                )
+        except ImportError:
+            pass  # TimeAuthority not available - skip check
+
         # Check 2: Symbol tradeable
         if cfg.require_tradeable and not snapshot.is_tradeable:
             reasons.append(BlockReason.SYMBOL_HALTED)

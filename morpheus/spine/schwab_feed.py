@@ -195,6 +195,16 @@ class SchwabFeedService:
     async def _on_quote(self, update: QuoteUpdate) -> None:
         """Handle incoming quote from Schwab streamer → publish to NATS."""
         try:
+            # Ingest broker timestamp into TimeAuthority
+            try:
+                from morpheus.core.time_authority import get_time_authority
+                get_time_authority().update_from_schwab_quote(
+                    quote_time=update.quote_time,
+                    trade_time=update.trade_time,
+                )
+            except ImportError:
+                pass
+
             msg = QuoteMsg(
                 sym=update.symbol,
                 bid=update.bid_price or 0.0,
