@@ -2202,7 +2202,7 @@ def main():
         "morpheus.server.main:create_app",
         factory=True,
         host="0.0.0.0",
-        port=8010,
+        port=8020,
         log_level="info",
         reload=False,
     )

@@ -22,7 +22,7 @@ $ErrorActionPreference = "Stop"
 
 $MORPHEUS_AI_DIR = "C:\Morpheus_AI"
 $MORPHEUS_UI_DIR = "C:\Morpheus_UI"
-$API_PORT = 8010
+$API_PORT = 8020
 $VITE_PORT = 5173
 $HEALTH_CHECK_URL = "http://localhost:$API_PORT/health"
 $MAX_WAIT_SECONDS = 30
