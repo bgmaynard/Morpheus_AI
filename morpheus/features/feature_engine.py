@@ -96,6 +96,11 @@ class FeatureContext:
     # Strategies may reference but NOT mutate these values
     external: dict[str, Any] = field(default_factory=dict)
 
+    # MASS Structure Classification (set by StructureAnalyzer)
+    structure_grade: str = ""  # "A", "B", "C", or "" (not classified)
+    structure_score: float = 0.0  # 0-100 composite score
+    structure_data: dict[str, Any] = field(default_factory=dict)
+
     # Metadata
     bars_available: int = 0
     warmup_complete: bool = False
@@ -112,6 +117,9 @@ class FeatureContext:
             "regime_components": self.regime_components,
             "allowed_strategies": list(self.allowed_strategies),
             "external": self.external,  # Scanner context (read-only)
+            "structure_grade": self.structure_grade,
+            "structure_score": self.structure_score,
+            "structure_data": self.structure_data,
             "bars_available": self.bars_available,
             "warmup_complete": self.warmup_complete,
         }
@@ -132,6 +140,27 @@ class FeatureContext:
     def has_feature(self, name: str) -> bool:
         """Check if a feature is available (not None)."""
         return self.features.get(name) is not None
+
+
+def update_feature_context_with_structure(
+    context: FeatureContext,
+    structure_grade: str,
+    structure_score: float,
+    structure_data: dict[str, Any],
+) -> FeatureContext:
+    """
+    Create a new FeatureContext with MASS structure classification attached.
+
+    Since FeatureContext is frozen, this creates a new instance via replace().
+    """
+    from dataclasses import replace
+
+    return replace(
+        context,
+        structure_grade=structure_grade,
+        structure_score=structure_score,
+        structure_data=structure_data,
+    )
 
 
 def candle_to_ohlcv(candle: Candle) -> OHLCV:

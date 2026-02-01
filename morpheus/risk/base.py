@@ -46,6 +46,11 @@ class VetoReason(Enum):
     MANUAL_HALT = "manual_halt"
     INSUFFICIENT_ROOM_TO_PROFIT = "insufficient_room_to_profit"  # Spread/slippage eats profit
 
+    # MASS-specific veto reasons
+    SYMBOL_COOLDOWN = "symbol_cooldown"
+    REGIME_POSITION_LIMIT = "regime_position_limit"
+    STRATEGY_RISK_EXCEEDED = "strategy_risk_exceeded"
+
 
 class RiskDecision(Enum):
     """Risk evaluation decision outcomes."""

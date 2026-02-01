@@ -54,6 +54,21 @@ from morpheus.strategies.base import (
 from morpheus.strategies.momentum import get_momentum_strategies
 from morpheus.strategies.mean_reversion import get_mean_reversion_strategies
 from morpheus.strategies.premarket_observer import get_premarket_strategies
+from morpheus.strategies.mass_strategies import get_mass_strategies
+
+# MASS (Morpheus Adaptive Strategy System)
+from morpheus.core.mass_config import MASSConfig
+from morpheus.structure.analyzer import StructureAnalyzer
+from morpheus.structure.types import StructureGrade
+from morpheus.classify.classifier import StrategyClassifier
+from morpheus.classify.types import ClassificationResult
+from morpheus.features.feature_engine import update_feature_context_with_structure
+from morpheus.regime.mass_regime import MASSRegimeMapper, MASSRegime
+from morpheus.risk.mass_risk_governor import MASSRiskGovernor, MASSRiskConfig
+from morpheus.evolve.tracker import PerformanceTracker
+from morpheus.evolve.weight_manager import StrategyWeightManager
+from morpheus.supervise.supervisor import AISupervisor
+from morpheus.supervise.config import SupervisorConfig
 
 # Scoring & Gate
 from morpheus.scoring.base import Scorer, ScoredSignal, GateResult, GateDecision
@@ -169,6 +184,7 @@ class SignalPipeline:
         config: PipelineConfig | None = None,
         emit_event: Callable[[Event], Awaitable[None]] | None = None,
         external_context_provider: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
+        mass_config: MASSConfig | None = None,
     ):
         """
         Initialize the signal pipeline.
@@ -178,11 +194,13 @@ class SignalPipeline:
             emit_event: Async callback to emit events (for server integration)
             external_context_provider: Async callback to fetch external context for a symbol
                                        (e.g., from MAX_AI_SCANNER for scanner_score, gap_pct, etc.)
+            mass_config: MASS configuration (None = use defaults with MASS enabled)
         """
         self.config = config or PipelineConfig()
         self._emit_event = emit_event
         self._external_context_provider = external_context_provider
         self._state = PipelineState()
+        self._mass_config = mass_config or MASSConfig()
 
         # Initialize components
         self._feature_engine = FeatureEngine(
@@ -236,9 +254,42 @@ class SignalPipeline:
         # Kill switch
         self._kill_switch = KillSwitch()
 
+        # MASS Phase 1 components
+        if self._mass_config.enabled:
+            self._structure_analyzer = StructureAnalyzer(self._mass_config.structure)
+            self._strategy_classifier = StrategyClassifier(self._mass_config.classifier)
+            logger.info("[PIPELINE] MASS enabled: Structure Analyzer + Strategy Classifier active")
+        else:
+            self._structure_analyzer = None
+            self._strategy_classifier = None
+
+        # MASS Phase 2 components
+        self._mass_regime_mapper = MASSRegimeMapper()
+        self._performance_tracker = PerformanceTracker()
+        self._weight_manager = StrategyWeightManager(
+            tracker=self._performance_tracker,
+            base_weights=self._mass_config.classifier.strategy_weights if self._mass_config else {},
+        )
+        self._supervisor = AISupervisor(
+            tracker=self._performance_tracker,
+            weight_manager=self._weight_manager,
+            config=SupervisorConfig(),
+        )
+        self._current_mass_regime: MASSRegime | None = None
+
+        # Wrap risk manager with MASS governor if enabled
+        if self._mass_config.enabled and self._mass_config.regime_mapping_enabled:
+            self._risk_manager = MASSRiskGovernor(
+                base_manager=self._risk_manager,
+                mass_config=MASSRiskConfig(),
+                strategy_risk_overrides=self._mass_config.strategy_risk_overrides,
+            )
+            logger.info("[PIPELINE] MASS Risk Governor active")
+
         logger.info(
             f"[PIPELINE] Initialized with permissive_mode={self.config.permissive_mode}, "
-            f"room_to_profit={self.config.enable_room_to_profit}"
+            f"room_to_profit={self.config.enable_room_to_profit}, "
+            f"mass_enabled={self._mass_config.enabled}"
         )
 
     def _register_strategies(self) -> None:
@@ -260,6 +311,14 @@ class SignalPipeline:
         for strategy in get_mean_reversion_strategies():
             self._strategy_runner.register(strategy)
             logger.debug(f"[PIPELINE] Registered strategy: {strategy.name}")
+
+        # MASS strategies
+        for strategy in get_mass_strategies():
+            self._strategy_runner.register(strategy)
+            logger.debug(
+                f"[PIPELINE] Registered MASS strategy: {strategy.name} "
+                f"(modes: {strategy.allowed_market_modes})"
+            )
 
         # Log summary by mode
         premarket_strategies = self._strategy_runner.get_strategies_for_mode("PREMARKET")
@@ -499,9 +558,51 @@ class SignalPipeline:
             )
             await self._emit(regime_event)
 
-            # Stage 3: Route strategies
-            routing = self._strategy_router.route(regime)
-            feature_context = update_feature_context_with_strategies(feature_context, routing)
+            # Stage 2.3: MASS Regime Mapping (HOT/NORMAL/CHOP/DEAD)
+            if self._mass_config.enabled:
+                mass_regime = self._mass_regime_mapper.map(regime)
+                self._current_mass_regime = mass_regime
+                # Update MASS risk governor with current regime
+                if isinstance(self._risk_manager, MASSRiskGovernor):
+                    self._risk_manager.set_regime_mode(mass_regime.mode.value)
+
+            # Stage 2.5: MASS Structure Analysis (if enabled)
+            if self._structure_analyzer and self._mass_config.enabled:
+                structure_grade = self._structure_analyzer.classify(feature_context, snapshot)
+                feature_context = update_feature_context_with_structure(
+                    feature_context,
+                    structure_grade=structure_grade.grade,
+                    structure_score=structure_grade.score,
+                    structure_data=structure_grade.to_event_payload(),
+                )
+                await self._emit(structure_grade.to_event(symbol))
+                logger.debug(
+                    f"[PIPELINE] {symbol} structure: grade={structure_grade.grade} "
+                    f"score={structure_grade.score:.0f}"
+                )
+
+            # Stage 2.7: MASS Strategy Classification (if enabled)
+            if self._strategy_classifier and self._mass_config.enabled:
+                classification = self._strategy_classifier.classify(
+                    features=feature_context,
+                    structure=structure_grade,
+                    regime=regime,
+                    market_mode=market_mode,
+                )
+                if classification.assigned_strategies:
+                    # Override allowed_strategies with MASS classification
+                    from dataclasses import replace as dc_replace
+                    feature_context = dc_replace(
+                        feature_context,
+                        allowed_strategies=tuple(
+                            s.value for s in classification.assigned_strategies
+                        ),
+                    )
+                await self._emit(classification.to_event())
+            else:
+                # Fallback: Use original StrategyRouter when MASS is disabled
+                routing = self._strategy_router.route(regime)
+                feature_context = update_feature_context_with_strategies(feature_context, routing)
 
             # Stage 4: Generate signals (filtered by market mode)
             strategy_context = StrategyContext(
@@ -755,4 +856,12 @@ class SignalPipeline:
                 }
                 for symbol in self._state.active_symbols
             },
+            # MASS status
+            "mass_enabled": self._mass_config.enabled,
+            "mass_structure_analyzer": self._structure_analyzer is not None,
+            "mass_strategy_classifier": self._strategy_classifier is not None,
+            "mass_regime": self._current_mass_regime.to_event_payload() if self._current_mass_regime else None,
+            "mass_regime_mapping_enabled": self._mass_config.regime_mapping_enabled,
+            "mass_feedback_enabled": self._mass_config.feedback_enabled,
+            "mass_supervisor_enabled": self._mass_config.supervisor_enabled,
         }

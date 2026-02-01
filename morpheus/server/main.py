@@ -811,6 +811,9 @@ class MorpheusServer:
                 "timestamp": quote.quote_time.isoformat(),
                 "is_tradeable": quote.is_tradeable,
                 "is_market_open": quote.is_market_open,
+                "close": quote.close_price,
+                "change": quote.net_change,
+                "change_percent": quote.net_change_percent,
             }
         except Exception as e:
             logger.error(f"Failed to get quote for {symbol}: {e}")
@@ -1141,10 +1144,13 @@ class MorpheusServer:
                                     "timestamp": quote["timestamp"],
                                     "is_tradeable": quote["is_tradeable"],
                                     "is_market_open": quote["is_market_open"],
+                                    "close": quote["close"],
+                                    "change": quote["change"],
+                                    "change_percent": quote["change_percent"],
                                     "source": "SCHWAB",
                                 },
                             ))
-                            logger.info(f"[DATA] QUOTE_UPDATE {symbol} ${quote['last']:.2f}")
+                            logger.info(f"[DATA] QUOTE_UPDATE {symbol} ${quote['last']:.2f} ({quote['change_percent']:+.2f}%)")
                     except Exception as e:
                         logger.error(f"Error fetching quote for {symbol}: {e}")
 
@@ -1875,6 +1881,77 @@ def create_app() -> FastAPI:
             "enabled": True,
             "status": status,
         }
+
+    # =========================================================================
+    # MASS (Morpheus Adaptive Strategy System) API Endpoints
+    # =========================================================================
+
+    @app.get("/api/mass/status")
+    async def get_mass_status():
+        """Get MASS system status - regime, structure, classifier, supervisor."""
+        if not server._pipeline_available or not server._pipeline:
+            return {"enabled": False, "message": "Pipeline not available"}
+
+        pipeline = server._pipeline
+        status = pipeline.get_status()
+        result = {
+            "enabled": status.get("mass_enabled", False),
+            "regime": status.get("mass_regime"),
+            "regime_mapping_enabled": status.get("mass_regime_mapping_enabled", False),
+            "feedback_enabled": status.get("mass_feedback_enabled", False),
+            "supervisor_enabled": status.get("mass_supervisor_enabled", False),
+            "structure_analyzer_active": status.get("mass_structure_analyzer", False),
+            "strategy_classifier_active": status.get("mass_strategy_classifier", False),
+        }
+
+        # Add supervisor status if available
+        if hasattr(pipeline, "_supervisor"):
+            result["supervisor"] = pipeline._supervisor.get_status()
+
+        return result
+
+    @app.get("/api/mass/performance")
+    async def get_mass_performance():
+        """Get per-strategy performance metrics."""
+        if not server._pipeline_available or not server._pipeline:
+            return {"error": "Pipeline not available"}
+
+        pipeline = server._pipeline
+        if hasattr(pipeline, "_performance_tracker"):
+            return {
+                "strategies": pipeline._performance_tracker.get_all_performance_dicts(),
+                "total_outcomes": pipeline._performance_tracker.total_outcomes,
+            }
+        return {"strategies": {}, "total_outcomes": 0}
+
+    @app.get("/api/mass/weights")
+    async def get_mass_weights():
+        """Get current strategy weights."""
+        if not server._pipeline_available or not server._pipeline:
+            return {"error": "Pipeline not available"}
+
+        pipeline = server._pipeline
+        if hasattr(pipeline, "_weight_manager"):
+            return pipeline._weight_manager.to_dict()
+        return {"current_weights": {}, "base_weights": {}}
+
+    @app.post("/api/mass/supervisor/check")
+    async def trigger_supervisor_check():
+        """Trigger a supervisor health check."""
+        if not server._pipeline_available or not server._pipeline:
+            return {"error": "Pipeline not available"}
+
+        pipeline = server._pipeline
+        if hasattr(pipeline, "_supervisor"):
+            alerts = pipeline._supervisor.check_health()
+            # Emit alert events
+            for alert in alerts:
+                await server._broadcast_event(alert.to_event())
+            return {
+                "alerts": [a.to_event_payload() for a in alerts],
+                "count": len(alerts),
+            }
+        return {"alerts": [], "count": 0}
 
     @app.get("/api/pipeline/events")
     async def get_pipeline_events(limit: int = 50, event_type: str | None = None):
