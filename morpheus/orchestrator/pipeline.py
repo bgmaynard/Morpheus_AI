@@ -185,6 +185,7 @@ class SignalPipeline:
         emit_event: Callable[[Event], Awaitable[None]] | None = None,
         external_context_provider: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
         mass_config: MASSConfig | None = None,
+        position_manager: Any = None,
     ):
         """
         Initialize the signal pipeline.
@@ -195,12 +196,14 @@ class SignalPipeline:
             external_context_provider: Async callback to fetch external context for a symbol
                                        (e.g., from MAX_AI_SCANNER for scanner_score, gap_pct, etc.)
             mass_config: MASS configuration (None = use defaults with MASS enabled)
+            position_manager: PaperPositionManager for live position tracking (optional)
         """
         self.config = config or PipelineConfig()
         self._emit_event = emit_event
         self._external_context_provider = external_context_provider
         self._state = PipelineState()
         self._mass_config = mass_config or MASSConfig()
+        self._position_manager = position_manager
 
         # Initialize components
         self._feature_engine = FeatureEngine(
@@ -222,7 +225,12 @@ class SignalPipeline:
         if self.config.permissive_mode:
             self._meta_gate = PermissiveMetaGate()
         else:
-            self._meta_gate = StandardMetaGate()
+            # Use standard gate with lowered threshold for stub_scorer
+            # TODO: Replace with proper threshold when ML scorer is implemented
+            from morpheus.scoring.meta_gate import StandardGateConfig
+            self._meta_gate = StandardMetaGate(
+                config=StandardGateConfig(min_confidence=0.3)
+            )
 
         # Position sizer
         sizer_config = PositionSizerConfig(
@@ -283,6 +291,7 @@ class SignalPipeline:
                 base_manager=self._risk_manager,
                 mass_config=MASSRiskConfig(),
                 strategy_risk_overrides=self._mass_config.strategy_risk_overrides,
+                position_manager=self._position_manager,
             )
             logger.info("[PIPELINE] MASS Risk Governor active")
 
@@ -766,6 +775,12 @@ class SignalPipeline:
         Returns True if signal should be processed, False if in cooldown.
         """
         symbol = signal.symbol
+
+        # Block signals while already holding a position in this symbol
+        if self._position_manager and self._position_manager.has_position(symbol):
+            logger.debug(f"[PIPELINE] {symbol} blocked: position already open")
+            return False
+
         recent = self._state.recent_signals.get(symbol)
 
         if recent is None:
@@ -791,11 +806,17 @@ class SignalPipeline:
 
     def _create_stub_account_state(self) -> AccountState:
         """
-        Create a stub account state for risk evaluation.
+        Create account state for risk evaluation.
 
-        In production, this should come from the broker integration.
-        For observational mode, we use conservative defaults.
+        If a position manager is available, returns real position/exposure data.
+        Otherwise falls back to conservative defaults.
         """
+        if self._position_manager:
+            return self._position_manager.get_account_state(
+                kill_switch_active=self._state.kill_switch_active,
+            )
+
+        # Fallback stub for when no position manager is available
         return AccountState(
             total_equity=Decimal("100000"),  # $100k default
             cash_available=Decimal("50000"),

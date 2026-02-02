@@ -61,24 +61,30 @@ class CatalystMomentumStrategy(Strategy):
         rvol = f.get_feature("relative_volume")
         scanner_rvol = f.external.get("rvol_proxy")
         effective_rvol = max(rvol or 0, scanner_rvol or 0)
-        if effective_rvol < 3.0:
+        if effective_rvol < 2.0:
             return self.create_no_signal(context)
 
-        # Bullish EMA stack
+        # EMA stack check - relaxed for gap stocks
+        # In premarket, EMAs lag the gap so we check price vs VWAP instead
         ema_9 = f.get_feature("ema_9")
         ema_21 = f.get_feature("ema_21")
-        if ema_9 is None or ema_21 is None or ema_9 <= ema_21:
-            return self.create_no_signal(context)
-
-        # Above VWAP
         vwap = f.get_feature("vwap")
-        if vwap is not None and price <= vwap:
+        gap_pct = f.external.get("gap_pct", 0)
+
+        # For big gap stocks (>10%), skip EMA stack requirement
+        # since EMAs haven't caught up to the gap yet
+        if gap_pct < 10:
+            if ema_9 is None or ema_21 is None or ema_9 <= ema_21:
+                return self.create_no_signal(context)
+
+        # Above VWAP (or above previous close for gap stocks)
+        if vwap is not None and price <= vwap and gap_pct < 5:
             return self.create_no_signal(context)
 
-        # RSI sweet spot
+        # RSI check - relaxed for gap stocks (indicators lag)
         rsi = f.get_feature("rsi_14")
-        if rsi is not None and (rsi < 55 or rsi > 80):
-            return self.create_no_signal(context)
+        if rsi is not None and rsi > 85:
+            return self.create_no_signal(context)  # Only filter extreme overbought
 
         # Compute reference levels
         atr = f.get_feature("atr_14")

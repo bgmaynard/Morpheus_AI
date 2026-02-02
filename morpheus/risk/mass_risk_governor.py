@@ -19,7 +19,10 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from morpheus.execution.paper_position_manager import PaperPositionManager
 
 from morpheus.risk.base import (
     AccountState,
@@ -40,10 +43,10 @@ logger = logging.getLogger(__name__)
 class MASSRiskConfig:
     """MASS-specific risk limits."""
 
-    max_risk_per_trade_pct: float = 0.0025   # 0.25% per trade
+    max_risk_per_trade_pct: float = 0.02     # 2% per trade (paper mode compatible)
     max_daily_loss_pct: float = 0.015        # 1.5% daily max
     max_correlation_positions: int = 2        # Max positions in same sector/correlation
-    symbol_cooldown_seconds: float = 900.0    # 15-min cooldown per symbol
+    symbol_cooldown_seconds: float = 60.0     # 60s cooldown per symbol (matches pipeline signal cooldown)
     max_concurrent_by_regime: dict[str, int] = field(
         default_factory=lambda: {
             "HOT": 5,
@@ -71,10 +74,12 @@ class MASSRiskGovernor(RiskOverlay):
         base_manager: RiskOverlay,
         mass_config: MASSRiskConfig | None = None,
         strategy_risk_overrides: dict[str, float] | None = None,
+        position_manager: Any = None,
     ):
         self._base_manager = base_manager
         self._config = mass_config or MASSRiskConfig()
         self._strategy_risk_overrides = strategy_risk_overrides or {}
+        self._position_manager = position_manager
 
         # Cooldown tracking: symbol -> last signal timestamp
         self._symbol_cooldowns: dict[str, datetime] = {}
@@ -115,8 +120,14 @@ class MASSRiskGovernor(RiskOverlay):
 
         # Check 1: Per-trade risk limit
         if account.total_equity > 0:
-            trade_risk_pct = float(position_size.risk_amount) / float(account.total_equity)
-            strategy_name = gate_result.signal.strategy_name if hasattr(gate_result, "signal") else ""
+            # Compute total risk amount from shares * risk_per_share
+            risk_amount = Decimal(position_size.shares) * position_size.risk_per_share
+            trade_risk_pct = float(risk_amount) / float(account.total_equity)
+            strategy_name = (
+                gate_result.scored_signal.signal.strategy_name
+                if gate_result.scored_signal and gate_result.scored_signal.signal
+                else ""
+            )
             max_risk = self._strategy_risk_overrides.get(
                 strategy_name, self._config.max_risk_per_trade_pct
             )
@@ -136,7 +147,11 @@ class MASSRiskGovernor(RiskOverlay):
             )
 
         # Check 3: Symbol cooldown
-        symbol = gate_result.signal.symbol if hasattr(gate_result, "signal") else ""
+        symbol = (
+            gate_result.scored_signal.symbol
+            if gate_result.scored_signal
+            else ""
+        )
         if symbol and symbol in self._symbol_cooldowns:
             last_signal_time = self._symbol_cooldowns[symbol]
             elapsed = (now - last_signal_time).total_seconds()
@@ -146,6 +161,11 @@ class MASSRiskGovernor(RiskOverlay):
                 details.append(
                     f"Symbol {symbol} in cooldown ({remaining:.0f}s remaining)"
                 )
+
+        # Check 3.5: Block re-entry while position is open
+        if self._position_manager and symbol and self._position_manager.has_position(symbol):
+            veto_reasons.append(VetoReason.POSITION_ALREADY_OPEN)
+            details.append(f"Already holding position in {symbol}")
 
         # Check 4: Regime-based position count limit
         regime_max = self._config.max_concurrent_by_regime.get(

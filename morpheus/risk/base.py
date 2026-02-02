@@ -50,6 +50,7 @@ class VetoReason(Enum):
     SYMBOL_COOLDOWN = "symbol_cooldown"
     REGIME_POSITION_LIMIT = "regime_position_limit"
     STRATEGY_RISK_EXCEEDED = "strategy_risk_exceeded"
+    POSITION_ALREADY_OPEN = "position_already_open"
 
 
 class RiskDecision(Enum):

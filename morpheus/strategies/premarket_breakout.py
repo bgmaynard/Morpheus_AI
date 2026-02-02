@@ -62,16 +62,16 @@ class PremarketBreakoutStrategy(Strategy):
         if vwap is not None and price <= vwap:
             return self.create_no_signal(context)
 
-        # RSI in sweet spot (not overextended)
+        # RSI check - relaxed for gap stocks (indicators lag the gap)
         rsi = f.get_feature("rsi_14")
-        if rsi is not None and (rsi < 50 or rsi > 75):
-            return self.create_no_signal(context)
+        if rsi is not None and rsi > 80:
+            return self.create_no_signal(context)  # Only filter extreme overbought
 
         # Relative volume confirmation
         rvol = f.get_feature("relative_volume")
         scanner_rvol = f.external.get("rvol_proxy")
         effective_rvol = max(rvol or 0, scanner_rvol or 0)
-        if effective_rvol < 2.0:
+        if effective_rvol < 1.5:
             return self.create_no_signal(context)
 
         # Structure grade check

@@ -89,6 +89,9 @@ except ImportError as e:
     logger.warning(f"MAX_AI Scanner client not available: {e}")
     MAX_AI_SCANNER_AVAILABLE = False
 
+# Paper position manager (exit management + position tracking)
+from morpheus.execution.paper_position_manager import PaperPositionManager
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -173,6 +176,9 @@ class MorpheusState:
 
         # Subscribed symbols for live streaming
         self.subscribed_symbols: set[str] = set()
+
+        # Latest quotes cache (populated by polling/streaming loop)
+        self.latest_quotes: dict[str, dict[str, Any]] = {}
 
         # Pipeline event history for monitoring (circular buffer)
         self.pipeline_events: list[dict[str, Any]] = []
@@ -288,6 +294,9 @@ class MorpheusServer:
         self._scanner: Scanner | None = None
         self._watchlist: Watchlist | None = None
         self._scanner_available = False
+
+        # Paper position manager (exit management + position tracking)
+        self._paper_position_manager: PaperPositionManager | None = None
 
         self._init_market_data()
         self._init_pipeline()
@@ -422,19 +431,40 @@ class MorpheusServer:
         try:
             # Create pipeline config (permissive for paper trading)
             config = PipelineConfig(
-                permissive_mode=True,  # Allow more signals for testing
+                permissive_mode=False,  # Use real risk management
                 min_signal_confidence=0.0,  # Emit all signals
                 respect_kill_switch=True,
             )
+
+            # MASS config with all Phase 2 features enabled
+            from morpheus.core.mass_config import MASSConfig
+            mass_config = MASSConfig(
+                enabled=True,
+                regime_mapping_enabled=True,
+                feedback_enabled=True,
+                supervisor_enabled=True,
+            )
+
+            # Create paper position manager for exit management + position tracking
+            self._paper_position_manager = PaperPositionManager(
+                emit_event=self.emit_event,
+                kill_switch_ref=lambda: self.state.kill_switch_active,
+            )
+            logger.info("Paper position manager initialized (exit management active)")
 
             # Create pipeline with emit callback
             self._pipeline = SignalPipeline(
                 config=config,
                 emit_event=self.emit_event,  # Wire to server's event emission
+                mass_config=mass_config,
+                position_manager=self._paper_position_manager,
             )
             self._pipeline_available = True
-            logger.info("Signal pipeline initialized successfully (OBSERVATIONAL MODE)")
+            logger.info("Signal pipeline initialized successfully (FULL MASS + RISK)")
             logger.info(f"  - Permissive mode: {config.permissive_mode}")
+            logger.info(f"  - MASS regime mapping: {mass_config.regime_mapping_enabled}")
+            logger.info(f"  - MASS feedback: {mass_config.feedback_enabled}")
+            logger.info(f"  - MASS supervisor: {mass_config.supervisor_enabled}")
             logger.info(f"  - Kill switch respect: {config.respect_kill_switch}")
 
             # Create candle aggregator to build 1-min candles from streaming quotes
@@ -556,7 +586,7 @@ class MorpheusServer:
                 integration_config = ScannerIntegrationConfig(
                     symbol_poll_interval=30.0,
                     halt_poll_interval=10.0,
-                    profiles=["FAST_MOVERS", "GAPPERS", "TOP_GAINERS"],
+                    profiles=["TOP_GAINERS", "GAPPERS"],
                     max_symbols=25,
                     auto_subscribe=True,
                     emit_discovery_events=True,
@@ -571,15 +601,97 @@ class MorpheusServer:
 
                 # Wire scanner context to pipeline for external augmentation
                 # This allows FeatureContext to include scanner_score, gap_pct, etc.
+                # Enriched with Morpheus's own Schwab quotes as fallback
                 if self._pipeline_available and self._pipeline:
                     self._pipeline.set_external_context_provider(
-                        self._scanner_integration.get_symbol_context
+                        self._get_enriched_external_context
                     )
                     logger.info("Pipeline wired to Scanner Integration (context augmentation enabled)")
 
         except Exception as e:
             logger.error(f"Failed to initialize scanner: {e}")
             self._scanner_available = False
+
+    async def _get_enriched_external_context(self, symbol: str) -> dict:
+        """
+        Get external context enriched with Morpheus's own Schwab quotes.
+
+        Falls back to Morpheus quote data when scanner returns zeroes.
+        This fixes the gap where the scanner's Schwab cache is empty but
+        Morpheus has live quotes from its own streaming/polling connection.
+        """
+        # Start with scanner data
+        context = {}
+        if self._scanner_available and self._scanner_integration:
+            try:
+                context = await self._scanner_integration.get_symbol_context(symbol)
+            except Exception:
+                context = {}
+
+        # Enrich with Morpheus's own Schwab quote data if scanner data is empty
+        if not context.get("scanner_score") and not context.get("gap_pct"):
+            try:
+                quote = self.state.latest_quotes.get(symbol, {})
+                # If cached quote lacks change_percent, fetch fresh from Schwab
+                if quote and not quote.get("change_percent"):
+                    fresh = self.get_quote(symbol)
+                    if fresh:
+                        quote = fresh
+                        self.state.latest_quotes[symbol] = fresh
+                if quote:
+                    change_pct = quote.get("change_percent", 0)
+                    volume = quote.get("volume", 0)
+                    last = quote.get("last", 0)
+                    close_price = quote.get("close", 0)
+
+                    # Compute gap_pct from change_percent (premarket gap from prev close)
+                    gap_pct = abs(change_pct) if change_pct else 0
+
+                    # Compute rvol_proxy from volume vs typical
+                    # Use a rough estimate: 100K is "normal" premarket volume for small-caps
+                    rvol_proxy = volume / 100_000 if volume else 0
+
+                    # Compute a basic scanner_score from available data
+                    # Score 0-100 based on change%, volume, spread
+                    score = 0
+                    if gap_pct >= 10:
+                        score += 40
+                    elif gap_pct >= 5:
+                        score += 30
+                    elif gap_pct >= 3:
+                        score += 20
+                    elif gap_pct >= 1:
+                        score += 10
+
+                    if volume >= 1_000_000:
+                        score += 30
+                    elif volume >= 500_000:
+                        score += 20
+                    elif volume >= 100_000:
+                        score += 10
+
+                    if rvol_proxy >= 5:
+                        score += 30
+                    elif rvol_proxy >= 2:
+                        score += 20
+                    elif rvol_proxy >= 1:
+                        score += 10
+
+                    context["scanner_score"] = max(context.get("scanner_score", 0), score)
+                    context["gap_pct"] = max(context.get("gap_pct", 0), gap_pct)
+                    context["rvol_proxy"] = max(context.get("rvol_proxy", 0), rvol_proxy)
+                    context["change_pct"] = change_pct
+                    context["_enriched_from"] = "SCHWAB_QUOTE_FALLBACK"
+
+                    if score >= 50:
+                        logger.info(
+                            f"[SCANNER-ENRICH] {symbol}: score={score} gap={gap_pct:.1f}% "
+                            f"rvol={rvol_proxy:.1f}x vol={volume:,}"
+                        )
+            except Exception as e:
+                logger.debug(f"[SCANNER-ENRICH] Error enriching {symbol}: {e}")
+
+        return context
 
     async def _handle_scanner_candidate(self, candidate: ScanResult) -> None:
         """Handle a new candidate from the scanner."""
@@ -748,6 +860,20 @@ class MorpheusServer:
                 },
             ))
             logger.debug(f"[STREAM] QUOTE {quote.symbol} ${price:.2f}")
+
+            # Cache quote for enrichment fallback
+            self.state.latest_quotes[quote.symbol] = {
+                "symbol": quote.symbol,
+                "bid": quote.bid_price,
+                "ask": quote.ask_price,
+                "last": price,
+                "volume": quote.volume,
+                "close": quote.close_price,
+                "change_percent": (
+                    ((price - quote.close_price) / quote.close_price * 100)
+                    if quote.close_price and quote.close_price > 0 else 0
+                ),
+            }
 
             # Feed quote to candle aggregator (builds 1-min candles)
             if self._candle_aggregator:
@@ -1034,6 +1160,9 @@ class MorpheusServer:
             },
         ))
 
+        # Restore persistent watchlist (force-add symbols from previous session)
+        await self._load_persistent_watchlist()
+
         logger.info("MorpheusServer started")
         logger.info("Trading data loop started")
 
@@ -1147,10 +1276,33 @@ class MorpheusServer:
                                     "close": quote["close"],
                                     "change": quote["change"],
                                     "change_percent": quote["change_percent"],
-                                    "source": "SCHWAB",
+                                    "source": "SCHWAB_POLL",
                                 },
                             ))
-                            logger.info(f"[DATA] QUOTE_UPDATE {symbol} ${quote['last']:.2f} ({quote['change_percent']:+.2f}%)")
+
+                            # Feed candle aggregator (same as streaming path)
+                            price = quote["last"]
+                            if self._candle_aggregator and price > 0:
+                                await self._candle_aggregator.on_quote(
+                                    symbol=symbol,
+                                    price=price,
+                                    volume=quote.get("volume", 0),
+                                )
+
+                            # Feed pipeline for real-time evaluation
+                            if self._pipeline_available and self._pipeline and price > 0:
+                                await self._pipeline.on_quote(
+                                    symbol=symbol,
+                                    last=price,
+                                    bid=quote.get("bid"),
+                                    ask=quote.get("ask"),
+                                    volume=quote.get("volume"),
+                                )
+
+                            # Cache quote for enrichment fallback
+                            self.state.latest_quotes[symbol] = quote
+
+                            logger.debug(f"[DATA] QUOTE {symbol} ${quote['last']:.2f} ({quote['change_percent']:+.2f}%)")
                     except Exception as e:
                         logger.error(f"Error fetching quote for {symbol}: {e}")
 
@@ -1162,7 +1314,7 @@ class MorpheusServer:
                 await asyncio.sleep(1.0)  # Back off on error
 
     async def emit_event(self, event: Event):
-        """Emit an event to all WebSocket clients and persist to database."""
+        """Emit an event to all WebSocket clients and persist to database + JSONL."""
         self.state.event_count += 1
         await self.ws_manager.broadcast(event)
         logger.debug(f"Event emitted: {event.event_type.value}")
@@ -1174,12 +1326,36 @@ class MorpheusServer:
             except Exception as e:
                 logger.error(f"Error persisting event: {e}")
 
+        # Persist event to JSONL via EventSink
+        try:
+            from morpheus.core.event_sink import get_event_sink
+            get_event_sink().emit(event)
+        except Exception as e:
+            logger.error(f"Error writing event to JSONL sink: {e}")
+
+        # Feed DecisionLogger for trade/signal/gating ledgers
+        try:
+            from morpheus.reporting.decision_logger import get_decision_logger
+            get_decision_logger().on_event(event)
+        except Exception as e:
+            logger.error(f"Error in decision logger: {e}")
+
+        # Feed PaperPositionManager for position tracking + exit management
+        if self._paper_position_manager:
+            try:
+                await self._paper_position_manager.on_event(event)
+            except Exception as e:
+                logger.error(f"Error in paper position manager: {e}")
+
         # Track pipeline-related events for monitoring
         pipeline_event_types = {
             EventType.FEATURES_COMPUTED,
             EventType.REGIME_DETECTED,
+            EventType.STRUCTURE_CLASSIFIED,
+            EventType.STRATEGY_ASSIGNED,
             EventType.SIGNAL_CANDIDATE,
             EventType.SIGNAL_SCORED,
+            EventType.SIGNAL_OBSERVED,
             EventType.META_APPROVED,
             EventType.META_REJECTED,
             EventType.RISK_APPROVED,
@@ -1190,6 +1366,55 @@ class MorpheusServer:
             # Keep only recent events
             if len(self.state.pipeline_events) > self.state.max_pipeline_events:
                 self.state.pipeline_events = self.state.pipeline_events[-self.state.max_pipeline_events:]
+
+        # Auto-confirm RISK_APPROVED signals in PAPER mode (no human needed)
+        if (
+            event.event_type == EventType.RISK_APPROVED
+            and self.state.trading_mode == TradingMode.PAPER
+            and not self.state.kill_switch_active
+        ):
+            try:
+                payload = event.payload or {}
+                symbol = event.symbol or ""
+                pos_size = payload.get("position_size", {})
+                shares = pos_size.get("shares", 100)
+                entry_price = float(pos_size.get("entry_price", 0))
+
+                # Block re-entry if already holding this symbol
+                if self._paper_position_manager and self._paper_position_manager.has_position(symbol):
+                    logger.info(f"[AUTO-TRADE] Blocked re-entry: already holding {symbol}")
+                elif symbol and entry_price > 0:
+                    # Extract signal metadata for position manager (stop/target/strategy)
+                    signal_data = (
+                        payload.get("gate_result", {})
+                        .get("scored_signal", {})
+                        .get("signal", {})
+                    )
+                    if self._paper_position_manager:
+                        self._paper_position_manager.set_signal_metadata(symbol, {
+                            "strategy_name": signal_data.get("strategy_name", "unknown"),
+                            "stop_price": signal_data.get("invalidation_reference", entry_price * 0.97),
+                            "target_price": signal_data.get("target_reference", entry_price * 1.03),
+                            "direction": signal_data.get("direction", "long"),
+                            "regime": signal_data.get("regime", ""),
+                            "structure_grade": signal_data.get("structure_grade", ""),
+                        })
+
+                    logger.info(
+                        f"[AUTO-TRADE] Paper auto-confirm: {symbol} "
+                        f"{shares} shares @ ${entry_price:.2f} "
+                        f"strategy={signal_data.get('strategy_name', '?')} "
+                        f"stop=${signal_data.get('invalidation_reference', 0):.4f} "
+                        f"target=${signal_data.get('target_reference', 0):.4f}"
+                    )
+                    asyncio.create_task(
+                        self._simulate_paper_order_sized(
+                            symbol, entry_price, shares,
+                            correlation_id=f"auto_{uuid.uuid4().hex[:8]}",
+                        )
+                    )
+            except Exception as e:
+                logger.error(f"[AUTO-TRADE] Error auto-confirming {event.symbol}: {e}")
 
     async def process_command(self, command: Command) -> CommandResult:
         """Process a command from UI."""
@@ -1294,6 +1519,51 @@ class MorpheusServer:
                 message=result.details,
             )
 
+    async def _simulate_paper_order_sized(
+        self, symbol: str, price: float, shares: int, correlation_id: str
+    ):
+        """Simulate paper order with actual position size from risk approval."""
+        client_order_id = f"paper_{uuid.uuid4().hex[:12]}"
+
+        # ORDER_SUBMITTED
+        await self.emit_event(create_event(
+            EventType.ORDER_SUBMITTED,
+            payload={
+                "client_order_id": client_order_id,
+                "symbol": symbol,
+                "side": "buy",
+                "quantity": shares,
+                "order_type": "market",
+                "limit_price": None,
+                "auto_confirmed": True,
+            },
+            symbol=symbol,
+            correlation_id=correlation_id,
+        ))
+
+        await asyncio.sleep(0.1)
+
+        # ORDER_FILL_RECEIVED
+        await self.emit_event(create_event(
+            EventType.ORDER_FILL_RECEIVED,
+            payload={
+                "client_order_id": client_order_id,
+                "symbol": symbol,
+                "side": "buy",
+                "filled_quantity": shares,
+                "fill_price": price,
+                "exec_id": f"exec_{uuid.uuid4().hex[:8]}",
+                "auto_confirmed": True,
+            },
+            symbol=symbol,
+            correlation_id=correlation_id,
+        ))
+
+        logger.info(
+            f"[AUTO-TRADE] Paper fill: {symbol} {shares} shares @ ${price:.2f} "
+            f"(order={client_order_id})"
+        )
+
     async def _simulate_paper_order(self, symbol: str, price: float, correlation_id: str):
         """Simulate paper order for testing."""
         client_order_id = f"paper_{uuid.uuid4().hex[:12]}"
@@ -1330,6 +1600,54 @@ class MorpheusServer:
             symbol=symbol,
             correlation_id=correlation_id,
         ))
+
+    # =========================================================================
+    # PERSISTENT WATCHLIST
+    # =========================================================================
+
+    WATCHLIST_FILE = "data/persistent_watchlist.json"
+
+    def _save_persistent_watchlist(self):
+        """Save current pipeline symbols to disk for restart persistence."""
+        try:
+            symbols = []
+            if self._pipeline_available and self._pipeline:
+                symbols = list(self._pipeline._state.active_symbols)
+            if not symbols:
+                symbols = list(self.state.subscribed_symbols)
+            data = {"symbols": sorted(symbols), "updated_at": datetime.now().isoformat()}
+            os.makedirs(os.path.dirname(self.WATCHLIST_FILE), exist_ok=True)
+            with open(self.WATCHLIST_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+            logger.debug(f"[WATCHLIST] Saved {len(symbols)} symbols to {self.WATCHLIST_FILE}")
+        except Exception as e:
+            logger.error(f"[WATCHLIST] Error saving: {e}")
+
+    async def _load_persistent_watchlist(self):
+        """Reload symbols from persistent watchlist on startup."""
+        try:
+            if not os.path.exists(self.WATCHLIST_FILE):
+                logger.info("[WATCHLIST] No persistent watchlist found")
+                return
+            with open(self.WATCHLIST_FILE) as f:
+                data = json.load(f)
+            symbols = data.get("symbols", [])
+            if not symbols:
+                return
+            logger.info(f"[WATCHLIST] Restoring {len(symbols)} symbols from persistent watchlist")
+            for sym in symbols:
+                sym = sym.upper().strip()
+                if not sym:
+                    continue
+                self.state.subscribed_symbols.add(sym)
+                if self._streamer_available and self._use_streaming and self._streamer:
+                    await self._streamer.subscribe_quotes([sym])
+                if self._pipeline_available and self._pipeline:
+                    self._pipeline.add_symbol(sym)
+                    asyncio.create_task(self._warmup_pipeline_symbol(sym))
+            logger.info(f"[WATCHLIST] Restored: {', '.join(symbols)}")
+        except Exception as e:
+            logger.error(f"[WATCHLIST] Error loading: {e}")
 
     async def _handle_set_symbol_chain(self, command: Command) -> CommandResult:
         """Handle SET_SYMBOL_CHAIN - update active symbol and auto-subscribe."""
@@ -2152,6 +2470,229 @@ def create_app() -> FastAPI:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    @app.post("/api/scanner/force-add/{symbol}")
+    async def force_add_symbol(symbol: str, reason: str = "manual_force"):
+        """Force-add a symbol directly to pipeline, bypassing watchlist lifecycle gates."""
+        symbol = symbol.upper().strip()
+        try:
+            # Subscribe to streaming quotes
+            server.state.subscribed_symbols.add(symbol)
+            if server._streamer_available and server._use_streaming and server._streamer:
+                await server._streamer.subscribe_quotes([symbol])
+
+            # Add directly to pipeline
+            if server._pipeline_available and server._pipeline:
+                server._pipeline.add_symbol(symbol)
+                asyncio.create_task(server._warmup_pipeline_symbol(symbol))
+
+            logger.info(f"[FORCE-ADD] {symbol} added directly to pipeline ({reason})")
+            server._save_persistent_watchlist()
+            return {"success": True, "symbol": symbol, "reason": reason, "pipeline": True}
+        except Exception as e:
+            logger.error(f"Force-add error for {symbol}: {e}")
+            return {"success": False, "symbol": symbol, "error": str(e)}
+
+    @app.post("/api/scanner/force-add-batch")
+    async def force_add_batch(symbols: list[str], reason: str = "manual_force"):
+        """Force-add multiple symbols directly to pipeline."""
+        results = []
+        for sym in symbols:
+            sym = sym.upper().strip()
+            if not sym:
+                continue
+            try:
+                server.state.subscribed_symbols.add(sym)
+                if server._streamer_available and server._use_streaming and server._streamer:
+                    await server._streamer.subscribe_quotes([sym])
+                if server._pipeline_available and server._pipeline:
+                    server._pipeline.add_symbol(sym)
+                    asyncio.create_task(server._warmup_pipeline_symbol(sym))
+                results.append({"symbol": sym, "success": True})
+            except Exception as e:
+                results.append({"symbol": sym, "success": False, "error": str(e)})
+
+        added = [r["symbol"] for r in results if r["success"]]
+        logger.info(f"[FORCE-ADD-BATCH] Added {len(added)} symbols to pipeline ({reason})")
+        if added:
+            server._save_persistent_watchlist()
+        return {"added": len(added), "symbols": added, "results": results}
+
+    # ========================================================================
+    # EOD Reports & Decision Logging
+    # ========================================================================
+
+    @app.post("/api/reports/eod/generate")
+    async def generate_eod_report(report_date: str | None = None):
+        """
+        Generate EOD report from today's JSONL ledgers.
+
+        Aggregates signal_ledger, trade_ledger, and gating_blocks into
+        an IBKR-comparable EOD summary. Saves to reports/{date}/.
+        """
+        from morpheus.reporting.decision_logger import get_decision_logger
+        from datetime import date as date_type
+        import json as json_mod
+
+        try:
+            if report_date:
+                target_date = date_type.fromisoformat(report_date)
+            else:
+                target_date = date_type.today()
+
+            date_str = target_date.isoformat()
+            dl = get_decision_logger()
+            day_dir = dl.get_reports_dir() / date_str
+
+            # Read ledgers
+            signals = _read_jsonl(day_dir / "signal_ledger.jsonl")
+            trades = _read_jsonl(day_dir / "trade_ledger.jsonl")
+            blocks = _read_jsonl(day_dir / "gating_blocks.jsonl")
+
+            # Filter: only SIGNAL_CANDIDATE entries (not decision updates)
+            signal_candidates = [s for s in signals if "approved" in s]
+            approved_signals = [s for s in signal_candidates if s.get("approved")]
+            rejected_from_signals = [s for s in signal_candidates if not s.get("approved") and not s.get("observed")]
+
+            # Trade stats
+            closed_trades = [t for t in trades if t.get("status") == "closed" or "pnl" in t]
+            wins = [t for t in closed_trades if (t.get("pnl") or 0) > 0]
+            losses = [t for t in closed_trades if (t.get("pnl") or 0) < 0]
+            pnls = [t.get("pnl", 0) for t in closed_trades]
+            total_pnl = sum(pnls)
+            win_rate = len(wins) / len(closed_trades) if closed_trades else 0
+
+            # Profit factor
+            gross_profit = sum(p for p in pnls if p > 0)
+            gross_loss = abs(sum(p for p in pnls if p < 0))
+            profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0)
+
+            # Gating breakdown
+            gating_by_reason: dict[str, int] = {}
+            gating_by_stage: dict[str, int] = {}
+            for b in blocks:
+                reason = b.get("reason", "unknown")
+                stage = b.get("stage", "unknown")
+                gating_by_reason[reason] = gating_by_reason.get(reason, 0) + 1
+                gating_by_stage[stage] = gating_by_stage.get(stage, 0) + 1
+
+            # Strategy breakdown
+            strategy_stats: dict[str, dict] = {}
+            for t in closed_trades:
+                strat = t.get("entry_signal", "unknown")
+                if strat not in strategy_stats:
+                    strategy_stats[strat] = {"trades": 0, "wins": 0, "losses": 0, "pnl": 0}
+                strategy_stats[strat]["trades"] += 1
+                strategy_stats[strat]["pnl"] += t.get("pnl", 0)
+                if (t.get("pnl") or 0) > 0:
+                    strategy_stats[strat]["wins"] += 1
+                else:
+                    strategy_stats[strat]["losses"] += 1
+
+            # Active symbols
+            all_symbols = set()
+            for s in signal_candidates:
+                sym = s.get("symbol", "")
+                if sym:
+                    all_symbols.add(sym)
+
+            # Build report
+            report = {
+                "date": date_str,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "summary": {
+                    "signals_detected": len(signal_candidates),
+                    "signals_approved": len(approved_signals),
+                    "signals_rejected": len(rejected_from_signals) + len(blocks),
+                    "trades_executed": len(closed_trades),
+                    "wins": len(wins),
+                    "losses": len(losses),
+                    "win_rate": round(win_rate, 4),
+                    "total_pnl": round(total_pnl, 2),
+                    "profit_factor": round(profit_factor, 2) if profit_factor != float("inf") else "inf",
+                },
+                "strategies": strategy_stats,
+                "gating_breakdown": {
+                    "by_reason": gating_by_reason,
+                    "by_stage": gating_by_stage,
+                    "total_blocks": len(blocks),
+                },
+                "market_context": {
+                    "active_symbols": sorted(all_symbols),
+                    "total_symbols_tracked": len(all_symbols),
+                },
+                "trade_details": closed_trades,
+                "non_trades": blocks[:100],  # Cap at 100 for readability
+            }
+
+            # Save JSON
+            day_dir.mkdir(parents=True, exist_ok=True)
+            json_path = day_dir / f"eod_{date_str}.json"
+            with open(json_path, "w", encoding="utf-8") as f:
+                json_mod.dump(report, f, indent=2, default=str)
+
+            # Save Markdown
+            md_path = day_dir / f"eod_{date_str}.md"
+            md_content = _generate_eod_markdown(report)
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(md_content)
+
+            logger.info(f"[EOD] Report generated: {json_path}")
+            return {
+                "success": True,
+                "date": date_str,
+                "json_path": str(json_path),
+                "md_path": str(md_path),
+                "report": report,
+            }
+
+        except Exception as e:
+            logger.error(f"EOD report generation failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    @app.get("/api/reports/eod/{report_date}")
+    async def get_eod_report(report_date: str):
+        """Retrieve a saved EOD report by date."""
+        import json as json_mod
+        from morpheus.reporting.decision_logger import get_decision_logger
+
+        dl = get_decision_logger()
+        json_path = dl.get_reports_dir() / report_date / f"eod_{report_date}.json"
+
+        if not json_path.exists():
+            raise HTTPException(status_code=404, detail=f"No EOD report for {report_date}")
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            report = json_mod.load(f)
+
+        return report
+
+    @app.get("/api/reports/ledger/{report_date}/{ledger_type}")
+    async def get_ledger(report_date: str, ledger_type: str):
+        """
+        Retrieve a raw JSONL ledger by date and type.
+
+        ledger_type: 'signals', 'trades', 'blocks'
+        """
+        from morpheus.reporting.decision_logger import get_decision_logger
+
+        type_map = {
+            "signals": "signal_ledger.jsonl",
+            "trades": "trade_ledger.jsonl",
+            "blocks": "gating_blocks.jsonl",
+        }
+
+        if ledger_type not in type_map:
+            raise HTTPException(status_code=400, detail=f"Invalid ledger type. Use: {list(type_map.keys())}")
+
+        dl = get_decision_logger()
+        file_path = dl.get_reports_dir() / report_date / type_map[ledger_type]
+
+        if not file_path.exists():
+            return {"date": report_date, "ledger": ledger_type, "records": [], "count": 0}
+
+        records = _read_jsonl(file_path)
+        return {"date": report_date, "ledger": ledger_type, "records": records, "count": len(records)}
+
     @app.delete("/api/scanner/remove/{symbol}")
     async def remove_from_watchlist(symbol: str):
         """Remove a symbol from the watchlist."""
@@ -2178,6 +2719,114 @@ def create_app() -> FastAPI:
         return {"status": "signal_injected", "symbol": symbol.upper()}
 
     return app
+
+
+# ============================================================================
+# Helper functions for EOD report generation
+# ============================================================================
+
+
+def _read_jsonl(file_path: Path) -> list[dict]:
+    """Read a JSONL file and return list of dicts."""
+    import json as json_mod
+    records = []
+    if not file_path.exists():
+        return records
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    records.append(json_mod.loads(line))
+                except Exception:
+                    pass
+    return records
+
+
+def _generate_eod_markdown(report: dict) -> str:
+    """Generate a human-readable markdown EOD report."""
+    s = report.get("summary", {})
+    date_str = report.get("date", "unknown")
+
+    lines = [
+        f"# Morpheus EOD Report - {date_str}",
+        f"Generated: {report.get('generated_at', '')}",
+        "",
+        "## Summary",
+        "",
+        "| Metric | Value |",
+        "|--------|-------|",
+        f"| Signals Detected | {s.get('signals_detected', 0)} |",
+        f"| Signals Approved | {s.get('signals_approved', 0)} |",
+        f"| Signals Rejected | {s.get('signals_rejected', 0)} |",
+        f"| Trades Executed | {s.get('trades_executed', 0)} |",
+        f"| Wins | {s.get('wins', 0)} |",
+        f"| Losses | {s.get('losses', 0)} |",
+        f"| Win Rate | {s.get('win_rate', 0):.1%} |",
+        f"| Total P&L | ${s.get('total_pnl', 0):+.2f} |",
+        f"| Profit Factor | {s.get('profit_factor', 0)} |",
+        "",
+    ]
+
+    # Strategy breakdown
+    strategies = report.get("strategies", {})
+    if strategies:
+        lines.extend([
+            "## Strategy Breakdown",
+            "",
+            "| Strategy | Trades | Wins | Losses | P&L |",
+            "|----------|--------|------|--------|-----|",
+        ])
+        for strat, stats in strategies.items():
+            lines.append(
+                f"| {strat} | {stats.get('trades', 0)} | {stats.get('wins', 0)} | "
+                f"{stats.get('losses', 0)} | ${stats.get('pnl', 0):+.2f} |"
+            )
+        lines.append("")
+
+    # Gating breakdown
+    gating = report.get("gating_breakdown", {})
+    by_reason = gating.get("by_reason", {})
+    if by_reason:
+        lines.extend([
+            "## Gating Blocks",
+            "",
+            "| Reason | Count |",
+            "|--------|-------|",
+        ])
+        for reason, count in sorted(by_reason.items(), key=lambda x: -x[1]):
+            lines.append(f"| {reason} | {count} |")
+        lines.append("")
+
+    # Trade details
+    trades = report.get("trade_details", [])
+    if trades:
+        lines.extend([
+            "## Trade Details",
+            "",
+            "| Symbol | Dir | Strategy | P&L | % | Hold(s) | Exit Reason |",
+            "|--------|-----|----------|-----|---|---------|-------------|",
+        ])
+        for t in trades[:30]:
+            lines.append(
+                f"| {t.get('symbol', '')} | {t.get('direction', '')} | "
+                f"{t.get('entry_signal', '')} | ${t.get('pnl', 0):+.2f} | "
+                f"{t.get('pnl_percent', 0):+.1f}% | {t.get('hold_time_seconds', 0):.0f} | "
+                f"{t.get('exit_reason', '')} |"
+            )
+        lines.append("")
+
+    # Market context
+    ctx = report.get("market_context", {})
+    lines.extend([
+        "## Market Context",
+        "",
+        f"- **Active Symbols**: {ctx.get('total_symbols_tracked', 0)}",
+        f"- **Symbols**: {', '.join(ctx.get('active_symbols', [])[:20])}",
+        "",
+    ])
+
+    return "\n".join(lines)
 
 
 # ============================================================================
