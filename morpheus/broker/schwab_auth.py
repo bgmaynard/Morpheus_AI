@@ -91,7 +91,7 @@ class TokenData:
             token_type=data.get("token_type", "Bearer"),
             expires_in=data.get("expires_in", 1800),
             scope=data.get("scope", ""),
-            issued_at=data.get("issued_at", time.time()),
+            issued_at=data.get("issued_at", 0),  # Default to 0 (expired) to force refresh
         )
 
 

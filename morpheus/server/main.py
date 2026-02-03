@@ -266,6 +266,7 @@ class MorpheusServer:
         self._heartbeat_task: asyncio.Task | None = None
         self._market_data_task: asyncio.Task | None = None
         self._trading_data_task: asyncio.Task | None = None
+        self._token_refresh_task: asyncio.Task | None = None
 
         # Market data client (initialized lazily)
         self._market_client: Any = None
@@ -340,16 +341,15 @@ class MorpheusServer:
                 logger.info(f"Complete OAuth flow and save token to: {token_path}")
                 return
 
-            # If token is expired, try to refresh it
+            # Morpheus_AI is READ-ONLY for the shared token (IBKR bot owns refresh).
+            # If token is expired at startup, log it but proceed — the reload daemon
+            # will pick up the fresh token from disk once Morpheus writes it.
             if token.is_expired:
-                logger.info("Schwab access token expired, attempting refresh...")
-                try:
-                    auth.refresh_token(self._http_client)
-                    logger.info("Schwab token refreshed successfully")
-                except Exception as e:
-                    logger.error(f"Failed to refresh Schwab token: {e}")
-                    logger.info("Re-authenticate using /api/auth/schwab/url endpoint")
-                    return
+                logger.warning(
+                    "[TOKEN_RELOAD] Shared token is expired at startup. "
+                    "Waiting for Morpheus (IBKR bot) to refresh it. "
+                    "Market data will be unavailable until a valid token appears on disk."
+                )
 
             # Create market client
             self._market_client = SchwabMarketClient(auth=auth, http_client=self._http_client)
@@ -1118,10 +1118,46 @@ class MorpheusServer:
                 logger.error(f"Error in trading data loop: {e}")
                 await asyncio.sleep(5.0)
 
+    async def _token_reload_loop(self):
+        """Background loop that reloads shared token from disk (Morpheus is the writer)."""
+        logger.info("[TOKEN_RELOAD] Shared token reload daemon started (read-only, Morpheus owns refresh)")
+        while True:
+            try:
+                await asyncio.sleep(60)  # Check every 60 seconds
+                if self._auth:
+                    try:
+                        # Re-read token from shared file (Morpheus refreshes it)
+                        old_token = self._auth._token
+                        new_token = self._auth._load_token()
+                        if new_token and old_token:
+                            if new_token.access_token != old_token.access_token:
+                                self._auth._token = new_token
+                                logger.info(f"[TOKEN_RELOAD] Picked up refreshed token from shared file (expires in {new_token.seconds_until_expiry:.0f}s)")
+                                # Update streamer with new access token
+                                if self._streamer:
+                                    self._streamer.update_access_token(new_token.access_token)
+                                    logger.info("[TOKEN_RELOAD] Streamer token updated")
+                        elif new_token and not old_token:
+                            self._auth._token = new_token
+                            logger.info("[TOKEN_RELOAD] Loaded initial token from shared file")
+                    except Exception as e:
+                        logger.error(f"[TOKEN_RELOAD] Reload failed: {e}")
+            except asyncio.CancelledError:
+                logger.info("[TOKEN_RELOAD] Shared token reload daemon stopped")
+                break
+            except Exception as e:
+                logger.error(f"[TOKEN_RELOAD] Loop error: {e}")
+                await asyncio.sleep(30)
+
     async def start(self):
         """Start background tasks."""
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self._trading_data_task = asyncio.create_task(self._trading_data_loop())
+
+        # Start shared token reload daemon (read-only — Morpheus owns the refresh)
+        if self._auth:
+            self._token_refresh_task = asyncio.create_task(self._token_reload_loop())
+            logger.info("[TOKEN_RELOAD] Shared token reload daemon started (Morpheus is the token owner)")
 
         # Start streamer if available, otherwise fall back to polling
         if self._streamer_available and self._use_streaming and self._streamer:
@@ -1209,6 +1245,13 @@ class MorpheusServer:
             self._trading_data_task.cancel()
             try:
                 await self._trading_data_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._token_refresh_task:
+            self._token_refresh_task.cancel()
+            try:
+                await self._token_refresh_task
             except asyncio.CancelledError:
                 pass
 

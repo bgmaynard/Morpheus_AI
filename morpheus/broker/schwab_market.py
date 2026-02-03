@@ -128,6 +128,19 @@ class SchwabMarketClient:
             "Accept": "application/json",
         }
 
+    def _request_with_retry(self, method: str, url: str, **kwargs) -> Any:
+        """Make HTTP request with 401 retry (reload token from disk and retry once)."""
+        response = getattr(self.http, method)(url, headers=self._get_headers(), **kwargs)
+        if response.status_code == 401:
+            logger.warning("[401_RETRY] Got 401, reloading token from disk and retrying...")
+            new_token = self.auth._load_token()
+            if new_token:
+                self.auth._token = new_token
+                response = getattr(self.http, method)(url, headers=self._get_headers(), **kwargs)
+                if response.status_code == 200:
+                    logger.info("[401_RETRY] Retry succeeded with reloaded token")
+        return response
+
     def get_quote(self, symbol: str) -> QuoteData:
         """
         Get current quote for a single symbol.
@@ -145,11 +158,7 @@ class SchwabMarketClient:
         params = {"symbols": symbol.upper()}
 
         try:
-            response = self.http.get(
-                url,
-                headers=self._get_headers(),
-                params=params,
-            )
+            response = self._request_with_retry("get", url, params=params)
 
             if response.status_code != 200:
                 raise SchwabMarketError(
@@ -191,11 +200,7 @@ class SchwabMarketClient:
         params = {"symbols": ",".join(symbols_upper)}
 
         try:
-            response = self.http.get(
-                url,
-                headers=self._get_headers(),
-                params=params,
-            )
+            response = self._request_with_retry("get", url, params=params)
 
             if response.status_code != 200:
                 raise SchwabMarketError(
@@ -265,11 +270,7 @@ class SchwabMarketClient:
             params["endDate"] = int(end_date.timestamp() * 1000)
 
         try:
-            response = self.http.get(
-                url,
-                headers=self._get_headers(),
-                params=params,
-            )
+            response = self._request_with_retry("get", url, params=params)
 
             if response.status_code != 200:
                 raise SchwabMarketError(
@@ -455,11 +456,7 @@ class SchwabMarketClient:
         }
 
         try:
-            response = self.http.get(
-                url,
-                headers=self._get_headers(),
-                params=params,
-            )
+            response = self._request_with_retry("get", url, params=params)
 
             if response.status_code != 200:
                 logger.warning(f"Movers request failed: {response.status_code}")
