@@ -205,6 +205,95 @@ Pipeline now calls `position_manager.get_account_state()` which returns real val
 
 ---
 
+---
+
+## ISSUE 5: Max_UI Auth Code Needs Fixing
+
+Max_UI authentication code is broken - needs repair as part of tonight's auth fixes.
+
+---
+
+## Cross-Bot Fix Coordination (Tonight)
+
+### Morpheus_AI Issues
+1. Schwab token conflict (shared client_id) - **TOP PRIORITY**
+2. Missing `issued_at` in token file
+3. No 401 retry logic in schwab_market.py
+
+### IBKR_Algo_BOT_V2 Issues (from their list)
+- F1: Autonomous token renewal
+- F2: Reload endpoint
+- F3: Restart bug
+- F4: Scheduled task kill issue
+- Token sharing conflict - **TOP PRIORITY**
+
+### Max_UI Issues
+- Auth code broken - needs fix
+
+### Design Requirement: Fully Automated OAuth (No User Interaction)
+
+Currently when a refresh token expires (every 7 days) or gets orphaned by the other bot, recovery requires manual steps: open browser, log into Schwab, approve OAuth, copy callback URL back. This is labor-intensive and blocks trading until completed.
+
+**Goal:** Build a headless OAuth automation process that each bot can invoke when its refresh token fails, using stored Schwab login credentials to complete the full OAuth2 authorization code flow without any user interaction.
+
+**Proposed Architecture: Schwab Auto-Auth Service**
+
+```
+[Bot detects 401 / refresh failure]
+    → calls auto-auth module
+    → headless browser (Playwright/Selenium) opens Schwab OAuth URL
+    → auto-fills login credentials (stored securely, same creds as Schwab API)
+    → auto-approves OAuth consent
+    → captures redirect callback with auth code
+    → exchanges auth code for access_token + refresh_token
+    → saves new token to bot's token file
+    → bot resumes API calls
+```
+
+**Implementation Options:**
+
+**Option A: Shared Auto-Auth Service (RECOMMENDED)**
+- Single service that all 3 systems (Morpheus_AI, IBKR bot, Max_UI) can call
+- Manages ONE set of tokens per client_id
+- Exposes local endpoint: `POST /auth/refresh` → returns fresh token
+- Runs scheduled token refresh before expiry (e.g., every 25 min for access, every 6 days for refresh)
+- Eliminates the conflict entirely - one service, one token, served to all consumers
+- Could be a simple FastAPI or Flask app running on a fixed local port
+
+**Option B: Per-Bot Auto-Auth Module**
+- Each bot has its own copy of the headless auth logic
+- Each bot independently refreshes when needed
+- Still needs token coordination to avoid orphaning (same problem as today)
+- Simpler per-bot, but doesn't solve the shared-credential conflict
+
+**Option C: Hybrid - Shared Service + Separate Client IDs**
+- Create a second Schwab app for one of the bots
+- Auto-auth service manages both client_ids
+- No token conflicts possible
+- Each bot gets its own independent token lifecycle
+
+**Credential Storage:**
+- Schwab login username/password stored in encrypted local config or `.env`
+- Same credentials used for browser login to schwab.com
+- Only accessed by the auto-auth module, never transmitted externally
+- Could use Windows Credential Manager or a simple encrypted file
+
+**Dependencies:**
+- `playwright` (preferred - faster, more reliable than Selenium) or `selenium`
+- Headless Chromium/Chrome
+- Schwab login credentials (username + password)
+
+**Scheduled Refresh (Proactive, Not Reactive):**
+- Access token: refresh every 25 minutes (expires at 30)
+- Refresh token: full re-auth every 6 days (expires at 7)
+- On failure: retry 3x with backoff, then alert user
+- Keeps tokens perpetually fresh - bots never see a 401
+
+### Recommended Approach
+Upload both bots' issue reports to a shared chat so they can agree on a single token/auth strategy. All three systems (Morpheus_AI, IBKR_Algo_BOT_V2, Max_UI) need to be aligned on whichever approach is chosen.
+
+---
+
 ## Action Items for Tomorrow (2026-02-03)
 
 ### Must Fix Before Trading
