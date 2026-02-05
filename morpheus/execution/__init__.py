@@ -49,6 +49,13 @@ from morpheus.execution.schwab_adapter import (
     create_schwab_adapter,
     create_paper_adapter,
 )
+from morpheus.execution.paper_position_manager import (
+    ExitReason,
+    ExitPlan,
+    ExitConfig,
+    PaperPosition,
+    PaperPositionManager,
+)
 
 __all__ = [
     # Base
@@ -97,4 +104,10 @@ __all__ = [
     "PaperBrokerAdapter",
     "create_schwab_adapter",
     "create_paper_adapter",
+    # Exit Management v1
+    "ExitReason",
+    "ExitPlan",
+    "ExitConfig",
+    "PaperPosition",
+    "PaperPositionManager",
 ]

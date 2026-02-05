@@ -1,0 +1,35 @@
+{
+  "paper_equity": 500.0,
+  "risk_per_trade_pct": 0.02,
+  "max_quote_age_ms": 2000,
+  "max_spread_pct": 3.0,
+  "max_price_deviation_pct": 50.0,
+  "max_daily_loss_pct": 1.0,
+  "max_open_positions": 30,
+  "max_total_exposure_pct": 0.9,
+  "regime_position_limits": {
+    "HOT": 25,
+    "NORMAL": 25,
+    "CHOP": 25,
+    "DEAD": 0
+  },
+  "symbol_cooldown_seconds": 300.0,
+  "auto_confirm_enabled": true,
+  "max_hold_seconds": 300.0,
+  "hard_stop_pct": 0.03,
+  "trail_activation_pct": 0.01,
+  "trail_distance_pct": 0.015,
+  "strategy_max_hold": {
+    "order_flow_scalp": 120,
+    "premarket_breakout": 300,
+    "catalyst_momentum": 300,
+    "short_squeeze": 300,
+    "coil_breakout": 300,
+    "gap_fade": 300,
+    "day2_continuation": 600,
+    "first_pullback": 300,
+    "hod_continuation": 300,
+    "vwap_reclaim": 180
+  },
+  "last_reload": "2026-02-04T21:00:00+00:00"
+}

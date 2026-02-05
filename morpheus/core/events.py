@@ -67,9 +67,11 @@ class EventType(str, Enum):
     TRADE_ENTRY_FILLED = "TRADE_ENTRY_FILLED"
     TRADE_ACTIVE = "TRADE_ACTIVE"
     TRADE_EXIT_PENDING = "TRADE_EXIT_PENDING"
+    TRADE_EXITED = "TRADE_EXITED"  # Trade exited with reason (TIME_STOP, HARD_STOP, TRAIL_STOP)
     TRADE_CLOSED = "TRADE_CLOSED"
     TRADE_CANCELLED = "TRADE_CANCELLED"
     TRADE_ERROR = "TRADE_ERROR"
+    TRADE_REJECTED_NO_EXIT_PLAN = "TRADE_REJECTED_NO_EXIT_PLAN"  # Exit v1: No valid exit plan
 
     # System
     SYSTEM_START = "SYSTEM_START"
@@ -90,6 +92,15 @@ class EventType(str, Enum):
     SUPERVISOR_ALERT = "SUPERVISOR_ALERT"
     FEEDBACK_UPDATE = "FEEDBACK_UPDATE"
     STRATEGY_WEIGHT_ADJUSTED = "STRATEGY_WEIGHT_ADJUSTED"
+
+    # Worklist Events (Symbol Intake Pipeline)
+    WORKLIST_REJECTED = "WORKLIST_REJECTED"      # Symbol failed scrutiny
+    WORKLIST_ADDED = "WORKLIST_ADDED"            # New symbol added to worklist
+    WORKLIST_UPDATED = "WORKLIST_UPDATED"        # Existing symbol updated
+    WORKLIST_SCORED = "WORKLIST_SCORED"          # Symbol scored/re-scored
+    WORKLIST_SELECTED = "WORKLIST_SELECTED"      # Symbol selected for trading
+    WORKLIST_TRADED = "WORKLIST_TRADED"          # Symbol was traded
+    WORKLIST_RESET = "WORKLIST_RESET"            # Session reset performed
 
 
 class Event(BaseModel):

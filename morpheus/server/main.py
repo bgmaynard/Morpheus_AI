@@ -35,12 +35,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from morpheus.core.events import Event, EventType, create_event
+from morpheus.core.bot_identity import (
+    BOT_ID, BOT_NAME, BOT_VERSION,
+    get_bot_identity, acquire_bot_lock, release_bot_lock,
+    verify_bot_identity, get_running_bot_info,
+)
+from morpheus.core.runtime_config import (
+    get_runtime_config, get_runtime_config_manager,
+    reload_runtime_config, update_runtime_config,
+)
 from morpheus.execution.base import TradingMode, BlockReason
 from morpheus.execution.guards import (
     ConfirmationGuard,
     ConfirmationRequest,
     create_confirmation_guard,
+    QuoteFreshnessGuard,
+    QuoteFreshnessConfig,
+    create_quote_freshness_guard,
 )
+from morpheus.data.market_snapshot import create_snapshot
 
 # Market data imports (optional - graceful if not configured)
 try:
@@ -90,7 +103,22 @@ except ImportError as e:
     MAX_AI_SCANNER_AVAILABLE = False
 
 # Paper position manager (exit management + position tracking)
-from morpheus.execution.paper_position_manager import PaperPositionManager
+from morpheus.execution.paper_position_manager import PaperPositionManager, ExitPlan
+
+# Worklist pipeline (symbol intake, scrutiny, scoring)
+try:
+    from morpheus.worklist.pipeline import (
+        WorklistPipeline,
+        WorklistPipelineConfig,
+        get_worklist_pipeline,
+        reset_worklist_pipeline,
+    )
+    from morpheus.worklist.scrutiny import ScrutinyConfig
+    from morpheus.worklist.scoring import ScoringConfig
+    WORKLIST_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Worklist pipeline not available: {e}")
+    WORKLIST_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(
@@ -184,6 +212,11 @@ class MorpheusState:
         self.pipeline_events: list[dict[str, Any]] = []
         self.max_pipeline_events: int = 200
 
+        # Scanner health tracking (for auto-trade permission)
+        self.last_scanner_update: datetime | None = None
+        self.scanner_health_ok: bool = False
+        self.max_scanner_stale_seconds: float = 120.0  # 2 minutes
+
         logger.info("MorpheusState initialized with SAFE defaults")
         logger.info(f"  Trading Mode: {self.trading_mode.value}")
         logger.info(f"  Live Armed: {self.live_armed}")
@@ -263,10 +296,20 @@ class MorpheusServer:
         self.state = MorpheusState()
         self.ws_manager = WebSocketManager()
         self.confirmation_guard = create_confirmation_guard()
+        # Quote freshness guard - CRITICAL SAFETY (blocks orders on stale/invalid quotes)
+        self.quote_freshness_guard = create_quote_freshness_guard(
+            QuoteFreshnessConfig(
+                max_quote_age_ms=2000,  # 2 seconds max quote age
+                max_spread_pct=3.0,     # 3% max spread for small caps
+                max_price_deviation_pct=50.0,  # Bid/ask must be within 50% of last
+            )
+        )
         self._heartbeat_task: asyncio.Task | None = None
         self._market_data_task: asyncio.Task | None = None
         self._trading_data_task: asyncio.Task | None = None
         self._token_refresh_task: asyncio.Task | None = None
+        self._daily_reset_task: asyncio.Task | None = None
+        self._last_daily_reset: datetime | None = None
 
         # Market data client (initialized lazily)
         self._market_client: Any = None
@@ -299,10 +342,15 @@ class MorpheusServer:
         # Paper position manager (exit management + position tracking)
         self._paper_position_manager: PaperPositionManager | None = None
 
+        # Worklist pipeline (symbol intake, scrutiny, scoring)
+        self._worklist_pipeline: WorklistPipeline | None = None
+        self._worklist_available = False
+
         self._init_market_data()
         self._init_pipeline()
         self._init_persistence()
         self._init_scanner()
+        self._init_worklist()
 
     def _init_market_data(self):
         """Initialize Schwab market data client if credentials are available."""
@@ -445,12 +493,14 @@ class MorpheusServer:
                 supervisor_enabled=True,
             )
 
-            # Create paper position manager for exit management + position tracking
+            # Create paper position manager for Exit Management v1
             self._paper_position_manager = PaperPositionManager(
                 emit_event=self.emit_event,
                 kill_switch_ref=lambda: self.state.kill_switch_active,
+                get_runtime_config=get_runtime_config,  # Hot-reload support
             )
-            logger.info("Paper position manager initialized (exit management active)")
+            logger.info("[EXIT_MGR] Exit Management v1 initialized")
+            logger.info("[EXIT_MGR] All trades require valid exit plan (TIME_STOP, HARD_STOP, TRAIL_STOP)")
 
             # Create pipeline with emit callback
             self._pipeline = SignalPipeline(
@@ -611,6 +661,62 @@ class MorpheusServer:
         except Exception as e:
             logger.error(f"Failed to initialize scanner: {e}")
             self._scanner_available = False
+
+    def _init_worklist(self):
+        """Initialize the worklist pipeline for symbol intake, scrutiny, and scoring."""
+        if not WORKLIST_AVAILABLE:
+            logger.warning("Worklist pipeline not available")
+            return
+
+        try:
+            # Create scrutiny config (calibrated for small-cap momentum)
+            scrutiny_config = ScrutinyConfig(
+                min_price=0.50,
+                max_price=20.00,
+                min_volume=100_000,
+                min_rvol=1.5,
+                max_spread_pct=3.0,
+                min_scanner_score=50.0,
+                min_dollar_volume=100_000,
+                max_data_age_seconds=300.0,
+            )
+
+            # Create scoring config (deterministic priority scoring)
+            scoring_config = ScoringConfig(
+                weight_scanner_score=0.30,
+                weight_gap=0.25,
+                weight_rvol=0.25,
+                weight_volume=0.10,
+                weight_news=0.10,
+                news_present_bonus=1.10,
+            )
+
+            # Create pipeline config
+            pipeline_config = WorklistPipelineConfig(
+                scrutiny=scrutiny_config,
+                scoring=scoring_config,
+                min_score_for_trading=50.0,
+                max_active_symbols=20,
+                auto_reset_on_new_day=True,
+                archive_old_sessions=True,
+            )
+
+            # Initialize worklist pipeline with event emission
+            self._worklist_pipeline = get_worklist_pipeline(
+                config=pipeline_config,
+                emit_event=self.emit_event,
+            )
+            self._worklist_available = True
+
+            logger.info("Worklist pipeline initialized successfully")
+            logger.info(f"  - Min score for trading: {pipeline_config.min_score_for_trading}")
+            logger.info(f"  - Max active symbols: {pipeline_config.max_active_symbols}")
+            logger.info(f"  - Scrutiny: price ${scrutiny_config.min_price}-${scrutiny_config.max_price}")
+            logger.info(f"  - Scrutiny: min RVOL {scrutiny_config.min_rvol}x, min score {scrutiny_config.min_scanner_score}")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize worklist pipeline: {e}")
+            self._worklist_available = False
 
     async def _get_enriched_external_context(self, symbol: str) -> dict:
         """
@@ -776,24 +882,120 @@ class MorpheusServer:
 
         This is the ONLY path for symbols to enter the pipeline.
         Scanner is the eyes - Morpheus is the brain.
+
+        Flow: Scanner → Worklist (scrutiny + scoring) → Pipeline
         """
         try:
+            # Update scanner health - scanner is alive!
+            self.state.last_scanner_update = datetime.now(timezone.utc)
+            self.state.scanner_health_ok = True
+
             logger.info(f"[SCANNER] Symbol discovered: {symbol}")
 
-            # Add to subscribed symbols
-            self.state.subscribed_symbols.add(symbol)
+            # Get scanner context for worklist processing
+            scanner_context = {}
+            if self._scanner_available and self._scanner_integration:
+                try:
+                    scanner_context = await self._scanner_integration.get_symbol_context(symbol)
+                except Exception as e:
+                    logger.warning(f"[SCANNER] Could not get context for {symbol}: {e}")
 
-            # Subscribe to streaming quotes
-            if self._streamer_available and self._use_streaming and self._streamer:
-                await self._streamer.subscribe_quotes([symbol])
-                logger.info(f"[SCANNER] Subscribed to streaming: {symbol}")
+            # Process through worklist pipeline (scrutiny + scoring)
+            # This is the gatekeeper - only symbols that pass scrutiny enter the worklist
+            worklist_entry = None
+            if self._worklist_available and self._worklist_pipeline:
+                scanner_score = scanner_context.get("scanner_score", 50.0) or scanner_context.get("ai_score", 50.0) or 50.0
+                gap_pct = scanner_context.get("gap_pct", 0.0) or 0.0
+                rvol = scanner_context.get("rvol", 1.0) or scanner_context.get("rvol_proxy", 1.0) or 1.0
+                volume = scanner_context.get("volume", 0) or scanner_context.get("totalVolume", 0) or 0
+                price = scanner_context.get("price", 0.0) or scanner_context.get("last", 0.0) or scanner_context.get("lastPrice", 0.0) or 0.0
 
-            # Add to signal pipeline
-            if self._pipeline_available and self._pipeline:
-                self._pipeline.add_symbol(symbol)
-                # Warmup with historical data
-                asyncio.create_task(self._warmup_pipeline_symbol(symbol))
-                logger.info(f"[SCANNER] Added to pipeline: {symbol}")
+                # Extended scanner data for operator visibility (Float, Avg Volume, Short%)
+                float_shares = scanner_context.get("float_shares") or scanner_context.get("float")
+                avg_volume = scanner_context.get("averageVolume") or scanner_context.get("avg_volume")
+                short_pct = scanner_context.get("short_pct") or scanner_context.get("short_percent") or scanner_context.get("shortInterest")
+                market_cap = scanner_context.get("market_cap") or scanner_context.get("marketCap")
+
+                # Enhanced data for professional scanner alignment
+                rvol_5m = scanner_context.get("rvol_5m") or scanner_context.get("velocity_1m")  # 5-min RVOL
+                halt_status = scanner_context.get("halt_status")
+                halt_ts = scanner_context.get("halt_ts") or scanner_context.get("halt_time")
+                news_present = bool(scanner_context.get("news_present") or scanner_context.get("has_news"))
+                # Scanner news indicator is AUTHORITATIVE - if scanner says there's news, trust it
+                scanner_news_indicator = bool(
+                    scanner_context.get("scanner_news_indicator") or
+                    scanner_context.get("has_news") or
+                    scanner_context.get("news_indicator")
+                )
+
+                # If we don't have price from scanner, try to get from Schwab
+                if price <= 0:
+                    quote = self.state.latest_quotes.get(symbol)
+                    if quote:
+                        price = quote.get("last", 0.0)
+                        volume = volume or quote.get("volume", 0)
+
+                if price > 0:  # Only process if we have price data
+                    # Parse scanner timestamp for staleness check
+                    data_timestamp = None
+                    ts_str = scanner_context.get("_timestamp")
+                    if ts_str:
+                        try:
+                            data_timestamp = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        except (ValueError, AttributeError):
+                            pass
+
+                    # Check for halt status
+                    is_halted = halt_status == "HALTED"
+
+                    worklist_entry = await self._worklist_pipeline.process_scanner_row(
+                        symbol=symbol,
+                        scanner_score=scanner_score,
+                        gap_pct=gap_pct,
+                        rvol=rvol,
+                        volume=volume,
+                        price=price,
+                        is_halted=is_halted,
+                        data_timestamp=data_timestamp,
+                        # Extended data
+                        float_shares=float_shares,
+                        avg_volume=avg_volume,
+                        short_pct=short_pct,
+                        market_cap=market_cap,
+                        # Enhanced for professional alignment
+                        rvol_5m=rvol_5m,
+                        halt_ts=halt_ts,
+                        news_present=news_present,
+                        # Scanner news indicator is AUTHORITATIVE
+                        scanner_news_indicator=scanner_news_indicator,
+                    )
+
+                    if worklist_entry:
+                        logger.info(
+                            f"[WORKLIST] {symbol} added: score={worklist_entry.combined_priority_score:.1f}, "
+                            f"gap={gap_pct:.1f}%, rvol={rvol:.1f}x, state={worklist_entry.momentum_state}"
+                        )
+                    else:
+                        logger.info(f"[WORKLIST] {symbol} rejected by scrutiny")
+                else:
+                    logger.warning(f"[SCANNER] No price data for {symbol}, skipping worklist")
+
+            # Only add to pipeline if passed worklist scrutiny (or if worklist not available)
+            if worklist_entry or not self._worklist_available:
+                # Add to subscribed symbols
+                self.state.subscribed_symbols.add(symbol)
+
+                # Subscribe to streaming quotes
+                if self._streamer_available and self._use_streaming and self._streamer:
+                    await self._streamer.subscribe_quotes([symbol])
+                    logger.info(f"[SCANNER] Subscribed to streaming: {symbol}")
+
+                # Add to signal pipeline
+                if self._pipeline_available and self._pipeline:
+                    self._pipeline.add_symbol(symbol)
+                    # Warmup with historical data
+                    asyncio.create_task(self._warmup_pipeline_symbol(symbol))
+                    logger.info(f"[SCANNER] Added to pipeline: {symbol}")
 
         except Exception as e:
             logger.error(f"Error handling discovered symbol {symbol}: {e}")
@@ -1149,6 +1351,79 @@ class MorpheusServer:
                 logger.error(f"[TOKEN_RELOAD] Loop error: {e}")
                 await asyncio.sleep(30)
 
+    async def _daily_reset_loop(self):
+        """Background loop that purges watchlist at 4:00 AM ET daily for fresh movers."""
+        from morpheus.core.market_mode import get_time_et
+        logger.info("[DAILY_RESET] Daily reset daemon started (purges watchlist at 4:00 AM ET)")
+        while True:
+            try:
+                await asyncio.sleep(60)  # Check every minute
+                now_et = get_time_et()
+
+                # Check if it's 4:15 AM ET (after morning scheduled task)
+                if now_et.hour == 4 and now_et.minute == 15:
+                    # Only reset once per day
+                    today = now_et.date()
+                    if self._last_daily_reset is None or self._last_daily_reset.date() != today:
+                        logger.info("[DAILY_RESET] 4:00 AM ET - purging watchlist for fresh daily movers")
+                        await self._purge_watchlist_for_new_day()
+                        self._last_daily_reset = now_et
+                        logger.info("[DAILY_RESET] Daily purge complete")
+            except asyncio.CancelledError:
+                logger.info("[DAILY_RESET] Daily reset daemon stopped")
+                break
+            except Exception as e:
+                logger.error(f"[DAILY_RESET] Loop error: {e}")
+                await asyncio.sleep(60)
+
+    async def _purge_watchlist_for_new_day(self):
+        """Clear watchlist, pipeline symbols, and streaming subscriptions for fresh start."""
+        try:
+            # Clear watchlist
+            if self._watchlist:
+                self._watchlist.reset()
+                logger.info("[DAILY_RESET] Watchlist cleared")
+
+            # Clear pipeline symbols
+            if self._pipeline_available and self._pipeline:
+                symbols_to_remove = list(self._pipeline._state.active_symbols)
+                for sym in symbols_to_remove:
+                    self._pipeline.remove_symbol(sym)
+                logger.info(f"[DAILY_RESET] Removed {len(symbols_to_remove)} symbols from pipeline")
+
+            # Clear subscribed symbols
+            old_symbols = list(self.state.subscribed_symbols)
+            self.state.subscribed_symbols.clear()
+            logger.info(f"[DAILY_RESET] Cleared {len(old_symbols)} subscribed symbols")
+
+            # Unsubscribe from streaming (if using streamer)
+            if self._streamer_available and self._use_streaming and self._streamer:
+                for sym in old_symbols:
+                    try:
+                        await self._streamer.unsubscribe_quotes([sym])
+                    except Exception:
+                        pass  # Ignore unsubscribe errors
+                logger.info("[DAILY_RESET] Unsubscribed from streaming quotes")
+
+            # Clear persistent watchlist file
+            if os.path.exists(self.WATCHLIST_FILE):
+                os.remove(self.WATCHLIST_FILE)
+                logger.info("[DAILY_RESET] Persistent watchlist file removed")
+
+            # Reset paper position manager daily stats
+            if self._paper_position_manager:
+                self._paper_position_manager.reset_daily()
+                logger.info("[DAILY_RESET] Paper position manager daily stats reset")
+
+            # Emit event
+            await self.emit_event(create_event(
+                EventType.SYSTEM_STATUS,
+                payload={"action": "daily_reset", "message": "Watchlist purged for new trading day"},
+            ))
+
+        except Exception as e:
+            logger.error(f"[DAILY_RESET] Error during purge: {e}")
+
     async def start(self):
         """Start background tasks."""
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -1158,6 +1433,10 @@ class MorpheusServer:
         if self._auth:
             self._token_refresh_task = asyncio.create_task(self._token_reload_loop())
             logger.info("[TOKEN_RELOAD] Shared token reload daemon started (Morpheus is the token owner)")
+
+        # Start daily reset daemon (purges watchlist at 4:00 AM ET)
+        self._daily_reset_task = asyncio.create_task(self._daily_reset_loop())
+        logger.info("[DAILY_RESET] Daily reset daemon started (purges watchlist at 4:00 AM ET)")
 
         # Start streamer if available, otherwise fall back to polling
         if self._streamer_available and self._use_streaming and self._streamer:
@@ -1252,6 +1531,13 @@ class MorpheusServer:
             self._token_refresh_task.cancel()
             try:
                 await self._token_refresh_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._daily_reset_task:
+            self._daily_reset_task.cancel()
+            try:
+                await self._daily_reset_task
             except asyncio.CancelledError:
                 pass
 
@@ -1423,32 +1709,177 @@ class MorpheusServer:
                 shares = pos_size.get("shares", 100)
                 entry_price = float(pos_size.get("entry_price", 0))
 
+                # SCANNER HEALTH CHECK: No auto-trading if scanner is stale
+                # This prevents trades when MAX_AI is down or stalled
+                if self.state.last_scanner_update:
+                    scanner_age = (datetime.now(timezone.utc) - self.state.last_scanner_update).total_seconds()
+                    if scanner_age > self.state.max_scanner_stale_seconds:
+                        self.state.scanner_health_ok = False
+                        logger.warning(
+                            f"[AUTO-TRADE] SCANNER STALE: {symbol} blocked - "
+                            f"last update {scanner_age:.0f}s ago (max {self.state.max_scanner_stale_seconds}s)"
+                        )
+                        await self.emit_event(create_event(
+                            EventType.EXECUTION_BLOCKED,
+                            payload={
+                                "symbol": symbol,
+                                "block_reasons": ["SCANNER_STALE"],
+                                "details": f"Scanner data is {scanner_age:.0f}s old, max allowed is {self.state.max_scanner_stale_seconds}s",
+                            },
+                            symbol=symbol,
+                        ))
+                        return
+                else:
+                    # No scanner data ever received - block trading
+                    logger.warning(f"[AUTO-TRADE] SCANNER OFFLINE: {symbol} blocked - no scanner data received yet")
+                    await self.emit_event(create_event(
+                        EventType.EXECUTION_BLOCKED,
+                        payload={
+                            "symbol": symbol,
+                            "block_reasons": ["SCANNER_OFFLINE"],
+                            "details": "No scanner data received yet",
+                        },
+                        symbol=symbol,
+                    ))
+                    return
+
                 # Block re-entry if already holding this symbol
                 if self._paper_position_manager and self._paper_position_manager.has_position(symbol):
                     logger.info(f"[AUTO-TRADE] Blocked re-entry: already holding {symbol}")
-                elif symbol and entry_price > 0:
-                    # Extract signal metadata for position manager (stop/target/strategy)
+                    return
+
+                # WORKLIST CHECK: Trading MUST come from worklist only (Deliverable 5)
+                # This is the SINGLE GATEKEEPER - no trades outside worklist
+                if self._worklist_available and self._worklist_pipeline:
+                    if not self._worklist_pipeline.is_tradeable(symbol):
+                        logger.warning(f"[AUTO-TRADE] WORKLIST BLOCKED: {symbol} not in worklist or not tradeable")
+                        await self.emit_event(create_event(
+                            EventType.EXECUTION_BLOCKED,
+                            payload={
+                                "symbol": symbol,
+                                "block_reasons": ["NOT_IN_WORKLIST"],
+                                "details": "Symbol not in worklist or failed scrutiny/scoring",
+                            },
+                            symbol=symbol,
+                        ))
+                        return
+
+                if symbol and entry_price > 0:
+                    # CRITICAL SAFETY: Quote freshness check before order submission
+                    # This prevents catastrophic losses from stale/cached quotes
+                    quote = self.get_quote(symbol)
+                    if quote:
+                        quote_ts = datetime.fromisoformat(quote.get("timestamp", "").replace('Z', '+00:00')) if quote.get("timestamp") else datetime.now(timezone.utc)
+                        snapshot = create_snapshot(
+                            symbol=symbol,
+                            bid=float(quote.get("bid", 0)),
+                            ask=float(quote.get("ask", 0)),
+                            last=float(quote.get("last", 0)),
+                            volume=int(quote.get("volume", 0)),
+                            timestamp=quote_ts,
+                            is_market_open=quote.get("is_market_open", True),
+                            is_tradeable=quote.get("is_tradeable", True),
+                        )
+
+                        # Run quote freshness check
+                        freshness_check = self.quote_freshness_guard.check(
+                            risk_result=None,  # We don't need full risk result for quote check
+                            snapshot=snapshot,
+                            config=None,  # Uses guard's internal config
+                        )
+
+                        if freshness_check.is_blocked:
+                            block_reasons = [r.value for r in freshness_check.block_reasons]
+                            logger.warning(
+                                f"[AUTO-TRADE] QUOTE FRESHNESS BLOCKED: {symbol} - "
+                                f"reasons={block_reasons}, details={freshness_check.reason_details}"
+                            )
+                            # Emit EXECUTION_BLOCKED event for logging/analysis
+                            await self.emit_event(create_event(
+                                EventType.EXECUTION_BLOCKED,
+                                payload={
+                                    "symbol": symbol,
+                                    "block_reasons": block_reasons,
+                                    "details": freshness_check.reason_details,
+                                    "quote_age_ms": int((datetime.now(timezone.utc) - quote_ts).total_seconds() * 1000),
+                                    "bid": snapshot.bid,
+                                    "ask": snapshot.ask,
+                                    "last": snapshot.last,
+                                    "spread_pct": snapshot.spread_pct,
+                                    "entry_price_attempted": entry_price,
+                                },
+                                symbol=symbol,
+                            ))
+                            return  # Do NOT submit order with bad quote data
+
+                    # Extract signal metadata for exit plan validation
                     signal_data = (
                         payload.get("gate_result", {})
                         .get("scored_signal", {})
                         .get("signal", {})
                     )
+                    strategy_name = signal_data.get("strategy_name", "unknown")
+                    direction = signal_data.get("direction", "long")
+                    invalidation_ref = signal_data.get("invalidation_reference")
+
+                    # ══════════════════════════════════════════════════════════
+                    # EXIT MANAGEMENT v1: VALIDATE EXIT PLAN BEFORE ORDER
+                    # Core Rule: No trade without complete exit plan
+                    # ══════════════════════════════════════════════════════════
                     if self._paper_position_manager:
+                        exit_plan = self._paper_position_manager.validate_exit_plan(
+                            symbol=symbol,
+                            entry_price=entry_price,
+                            direction=direction,
+                            strategy_name=strategy_name,
+                            invalidation_reference=invalidation_ref,
+                        )
+
+                        if exit_plan is None:
+                            # REJECT: No valid exit plan
+                            logger.warning(
+                                f"[EXIT_MGR] TRADE REJECTED: {symbol} - no valid exit plan "
+                                f"(entry=${entry_price:.4f} stop_ref={invalidation_ref} strategy={strategy_name})"
+                            )
+                            await self.emit_event(create_event(
+                                EventType.TRADE_REJECTED_NO_EXIT_PLAN,
+                                payload={
+                                    "symbol": symbol,
+                                    "entry_price": entry_price,
+                                    "shares": shares,
+                                    "direction": direction,
+                                    "strategy_name": strategy_name,
+                                    "invalidation_reference": invalidation_ref,
+                                    "reason": "Exit plan validation failed - all three exit layers required",
+                                },
+                                symbol=symbol,
+                            ))
+                            return  # DO NOT TRADE
+
+                        # Store validated exit plan for position manager
                         self._paper_position_manager.set_signal_metadata(symbol, {
-                            "strategy_name": signal_data.get("strategy_name", "unknown"),
-                            "stop_price": signal_data.get("invalidation_reference", entry_price * 0.97),
-                            "target_price": signal_data.get("target_reference", entry_price * 1.03),
-                            "direction": signal_data.get("direction", "long"),
+                            "strategy_name": strategy_name,
+                            "direction": direction,
                             "regime": signal_data.get("regime", ""),
                             "structure_grade": signal_data.get("structure_grade", ""),
+                            # Exit plan parameters (validated)
+                            "hard_stop_price": exit_plan.hard_stop_price,
+                            "max_hold_seconds": exit_plan.max_hold_seconds,
+                            "trail_activation_pct": exit_plan.trail_activation_pct,
+                            "trail_distance_pct": exit_plan.trail_distance_pct,
                         })
+
+                        logger.info(
+                            f"[EXIT_MGR] EXIT PLAN OK: {symbol} "
+                            f"HARD_STOP=${exit_plan.hard_stop_price:.4f} "
+                            f"max_hold={exit_plan.max_hold_seconds:.0f}s "
+                            f"trail={exit_plan.trail_activation_pct:.1%}/{exit_plan.trail_distance_pct:.1%}"
+                        )
 
                     logger.info(
                         f"[AUTO-TRADE] Paper auto-confirm: {symbol} "
                         f"{shares} shares @ ${entry_price:.2f} "
-                        f"strategy={signal_data.get('strategy_name', '?')} "
-                        f"stop=${signal_data.get('invalidation_reference', 0):.4f} "
-                        f"target=${signal_data.get('target_reference', 0):.4f}"
+                        f"strategy={strategy_name}"
                     )
                     asyncio.create_task(
                         self._simulate_paper_order_sized(
@@ -1949,9 +2380,18 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """Application lifespan manager."""
+        # Acquire bot identity lock (Deliverable 4)
+        if not acquire_bot_lock():
+            logger.warning(f"[LIFESPAN] Could not acquire bot lock, continuing anyway")
+        else:
+            logger.info(f"[LIFESPAN] Bot identity: {BOT_ID} v{BOT_VERSION}")
+
         await server.start()
         yield
         await server.stop()
+
+        # Release bot lock on shutdown
+        release_bot_lock()
 
     app = FastAPI(
         title="Morpheus Trading Engine",
@@ -1990,6 +2430,81 @@ def create_app() -> FastAPI:
             websocket_clients=server.ws_manager.client_count,
             pipeline_enabled=server._pipeline_available,
         )
+
+    @app.get("/api/bot/identity")
+    async def bot_identity():
+        """
+        Bot Identity endpoint (Deliverable 4).
+
+        Returns bot identity info to prevent accidental shutdown
+        of wrong bot when multiple trading systems are running.
+        """
+        lock_info = get_running_bot_info()
+        return {
+            "bot_id": BOT_ID,
+            "bot_name": BOT_NAME,
+            "bot_version": BOT_VERSION,
+            "lock_info": lock_info,
+            "verified": verify_bot_identity(BOT_ID),
+        }
+
+    @app.get("/api/bot/verify/{expected_id}")
+    async def verify_bot(expected_id: str):
+        """
+        Verify bot identity before shutdown/control operations.
+
+        Use this endpoint to ensure you're controlling the right bot.
+        """
+        is_match = verify_bot_identity(expected_id)
+        return {
+            "expected": expected_id,
+            "actual": BOT_ID,
+            "verified": is_match,
+            "message": f"Bot identity {'VERIFIED' if is_match else 'MISMATCH'}",
+        }
+
+    # =========================================================================
+    # HOT RELOAD CONFIG (Deliverable 5)
+    # =========================================================================
+
+    @app.get("/api/config")
+    async def get_config():
+        """Get current runtime configuration."""
+        config = get_runtime_config()
+        return config.to_dict()
+
+    @app.post("/api/config/reload")
+    async def reload_config():
+        """
+        Hot reload configuration from disk.
+
+        Edit data/runtime_config.json and call this endpoint
+        to apply changes without restart.
+        """
+        success, message = reload_runtime_config()
+        if success:
+            logger.info(f"[CONFIG_RELOAD] {message}")
+            return {"success": True, "message": message}
+        else:
+            logger.error(f"[CONFIG_RELOAD] {message}")
+            raise HTTPException(status_code=400, detail=message)
+
+    @app.post("/api/config/update")
+    async def update_config(updates: dict):
+        """
+        Update specific config values and save to disk.
+
+        Example:
+            POST /api/config/update
+            {"paper_equity": 1000, "risk_per_trade_pct": 0.01}
+        """
+        success, message = update_runtime_config(updates)
+        if success:
+            logger.info(f"[CONFIG_UPDATE] {message}")
+            return {"success": True, "message": message, "config": get_runtime_config().to_dict()}
+        else:
+            logger.error(f"[CONFIG_UPDATE] {message}")
+            raise HTTPException(status_code=400, detail=message)
 
     @app.get("/api/time/status")
     async def time_authority_status():
@@ -2323,6 +2838,315 @@ def create_app() -> FastAPI:
             }
         return {"alerts": [], "count": 0}
 
+    # =========================================================================
+    # Exit Management v1 API Endpoints
+    # =========================================================================
+
+    @app.get("/api/exit/status")
+    async def get_exit_status():
+        """
+        Get Exit Management v1 status - positions, exits, config.
+
+        Exit v1 ensures every trade has:
+        1. TIME_STOP - mandatory failsafe
+        2. HARD_STOP - risk definition
+        3. TRAIL_STOP - profit protection
+        """
+        if not server._paper_position_manager:
+            return {"enabled": False, "message": "Exit management not available"}
+
+        pm = server._paper_position_manager
+        config = pm._get_exit_config()
+
+        return {
+            "enabled": True,
+            "version": "v1",
+            "positions": pm.get_positions_summary(),
+            "daily_stats": pm.get_daily_stats(),
+            "config": {
+                "max_hold_seconds": config.max_hold_seconds,
+                "hard_stop_pct": config.hard_stop_pct,
+                "trail_activation_pct": config.trail_activation_pct,
+                "trail_distance_pct": config.trail_distance_pct,
+                "strategy_max_hold": config.strategy_max_hold,
+            },
+        }
+
+    @app.get("/api/exit/positions")
+    async def get_exit_positions():
+        """Get all open positions with exit plan details."""
+        if not server._paper_position_manager:
+            return {"positions": [], "count": 0}
+
+        pm = server._paper_position_manager
+        positions = pm.get_positions_summary()
+        return {
+            "positions": positions,
+            "count": len(positions),
+        }
+
+    @app.get("/api/exit/closed")
+    async def get_closed_trades():
+        """Get all closed trades for today with exit reasons."""
+        if not server._paper_position_manager:
+            return {"trades": [], "count": 0}
+
+        pm = server._paper_position_manager
+        trades = pm.get_closed_trades()
+        stats = pm.get_daily_stats()
+        return {
+            "trades": trades,
+            "count": len(trades),
+            "exit_counts": stats.get("exit_counts", {}),
+            "realized_pnl": stats.get("realized_pnl", 0),
+            "win_rate": stats.get("win_rate", 0),
+        }
+
+    @app.post("/api/exit/config")
+    async def update_exit_config(
+        max_hold_seconds: float | None = None,
+        hard_stop_pct: float | None = None,
+        trail_activation_pct: float | None = None,
+        trail_distance_pct: float | None = None,
+    ):
+        """
+        Update exit config (hot-reload).
+
+        Changes take effect on next trade.
+        """
+        from morpheus.core.runtime_config import get_runtime_config, update_runtime_config
+
+        updates = {}
+        if max_hold_seconds is not None:
+            updates["max_hold_seconds"] = max_hold_seconds
+        if hard_stop_pct is not None:
+            updates["hard_stop_pct"] = hard_stop_pct
+        if trail_activation_pct is not None:
+            updates["trail_activation_pct"] = trail_activation_pct
+        if trail_distance_pct is not None:
+            updates["trail_distance_pct"] = trail_distance_pct
+
+        if updates:
+            update_runtime_config(**updates)
+            logger.info(f"[EXIT_MGR] Config updated: {updates}")
+
+        config = get_runtime_config()
+        return {
+            "success": True,
+            "config": {
+                "max_hold_seconds": config.max_hold_seconds,
+                "hard_stop_pct": config.hard_stop_pct,
+                "trail_activation_pct": config.trail_activation_pct,
+                "trail_distance_pct": config.trail_distance_pct,
+            },
+        }
+
+    @app.post("/api/mass/regime/override")
+    async def override_regime_mode(mode: str = "HOT"):
+        """
+        Override MASS regime mode to allow trading.
+
+        Modes: HOT (5 pos), NORMAL (3 pos), CHOP (2 pos), DEAD (0 pos)
+        """
+        valid_modes = {"HOT", "NORMAL", "CHOP", "DEAD"}
+        mode = mode.upper()
+        if mode not in valid_modes:
+            return {"error": f"Invalid mode. Valid: {valid_modes}"}
+
+        if not server._pipeline_available or not server._pipeline:
+            return {"error": "Pipeline not available"}
+
+        pipeline = server._pipeline
+        # Set on risk manager
+        if hasattr(pipeline, "_risk_manager") and hasattr(pipeline._risk_manager, "set_regime_mode"):
+            pipeline._risk_manager.set_regime_mode(mode)
+            logger.info(f"[REGIME_OVERRIDE] Set regime mode to {mode}")
+            return {"success": True, "mode": mode, "message": f"Regime overridden to {mode}"}
+
+        return {"error": "Risk manager not available"}
+
+    @app.post("/api/market/mode/override")
+    async def override_market_mode(active_trading: bool = True):
+        """
+        Override market mode to enable/disable active trading.
+
+        For paper trading during RTH when we want signals to be actionable.
+        """
+        from morpheus.core import market_mode
+
+        # Patch the RTH mode at runtime
+        market_mode.RTH = market_mode.MarketMode(
+            name="RTH",
+            active_trading=active_trading,
+            observe_only=not active_trading
+        )
+
+        logger.info(f"[MARKET_MODE_OVERRIDE] RTH active_trading={active_trading}")
+        return {
+            "success": True,
+            "active_trading": active_trading,
+            "message": f"RTH mode now {'ACTIVE' if active_trading else 'OBSERVE-ONLY'}"
+        }
+
+    # =========================================================================
+    # Worklist API Endpoints (Deliverable 7 - Observability)
+    # =========================================================================
+
+    @app.get("/api/worklist/status")
+    async def get_worklist_status():
+        """
+        Get worklist pipeline status and statistics.
+
+        Returns comprehensive observability data:
+        - Worklist size and symbol counts
+        - Scrutiny pass/reject rates
+        - Scoring breakdown
+        - Session info
+        - Scanner health status
+        """
+        if not server._worklist_available or not server._worklist_pipeline:
+            return {
+                "enabled": False,
+                "message": "Worklist pipeline not available",
+            }
+
+        status = server._worklist_pipeline.get_status()
+
+        # Add scanner health info for operator visibility
+        scanner_age_seconds = None
+        if server.state.last_scanner_update:
+            scanner_age_seconds = (datetime.now(timezone.utc) - server.state.last_scanner_update).total_seconds()
+
+        return {
+            "enabled": True,
+            "scanner_health": {
+                "ok": server.state.scanner_health_ok,
+                "last_update": server.state.last_scanner_update.isoformat() if server.state.last_scanner_update else None,
+                "age_seconds": scanner_age_seconds,
+                "max_stale_seconds": server.state.max_scanner_stale_seconds,
+                "auto_trade_permitted": scanner_age_seconds is not None and scanner_age_seconds < server.state.max_scanner_stale_seconds,
+            },
+            **status,
+        }
+
+    @app.get("/api/worklist/candidates")
+    async def get_worklist_candidates(n: int = 10, min_score: float = 50.0):
+        """
+        Get top N trading candidates from worklist.
+
+        Enhanced to mirror professional scanner cognitive model:
+        - Momentum state classification (RUNNING_UP, SQUEEZE, HALTED, etc.)
+        - Trigger reason explaining WHY this symbol is interesting
+        - RVOL velocity (5m vs daily)
+        - Float, short interest, halt status
+
+        Args:
+            n: Number of candidates to return (default 10)
+            min_score: Minimum combined score (default 50.0)
+        """
+        if not server._worklist_available or not server._worklist_pipeline:
+            return {"candidates": [], "error": "Worklist not available"}
+
+        candidates = server._worklist_pipeline.get_top_candidates(n=n, min_score=min_score)
+
+        # Build summary by momentum state for quick UI categorization
+        state_summary = {}
+        for c in candidates:
+            state = c.momentum_state or "unknown"
+            if state not in state_summary:
+                state_summary[state] = []
+            state_summary[state].append(c.symbol)
+
+        return {
+            "candidates": [c.to_dict() for c in candidates],
+            "count": len(candidates),
+            "min_score": min_score,
+            # Group by momentum state for UI categorization
+            "by_state": state_summary,
+            # Quick stats
+            "halted_count": len([c for c in candidates if c.halt_status == "HALTED"]),
+            "squeeze_count": len([c for c in candidates if c.momentum_state == "squeeze"]),
+            "running_up_count": len([c for c in candidates if c.momentum_state == "running_up"]),
+        }
+
+    @app.get("/api/worklist/symbol/{symbol}")
+    async def get_worklist_symbol(symbol: str):
+        """
+        Get worklist entry for a specific symbol with score explanation.
+
+        Returns full score breakdown for operator visibility,
+        including all boost factors (RVOL velocity, low float, squeeze, alerts).
+        """
+        if not server._worklist_available or not server._worklist_pipeline:
+            return {"error": "Worklist not available"}
+
+        entry = server._worklist_pipeline._store.get(symbol.upper())
+        if not entry:
+            return {"found": False, "symbol": symbol.upper()}
+
+        # Get score explanation with all enhanced parameters
+        score_explanation = server._worklist_pipeline._scorer.explain_score(
+            scanner_score=entry.scanner_score,
+            gap_pct=entry.gap_pct,
+            rvol=entry.rvol,
+            volume=entry.volume,
+            news_score=entry.news_score,
+            # Enhanced parameters
+            rvol_5m=entry.rvol_5m,
+            float_shares=entry.float_shares,
+            short_pct=entry.short_pct,
+            halt_status=entry.halt_status,
+            alert_count=entry.alert_count,
+            # Scanner news and category
+            scanner_news_indicator=entry.scanner_news_indicator,
+            news_category=entry.news_category,
+        )
+
+        return {
+            "found": True,
+            "entry": entry.to_dict(),
+            "is_tradeable": server._worklist_pipeline.is_tradeable(symbol.upper()),
+            "score_explanation": score_explanation,
+            # Quick summary for UI
+            "momentum_state": entry.momentum_state,
+            "trigger_context": entry.trigger_context,
+            "trigger_reason": entry.trigger_reason,
+            "news_hits": entry.news_hits,
+        }
+
+    @app.get("/api/worklist/tradeable/{symbol}")
+    async def check_tradeable(symbol: str):
+        """
+        Check if a symbol is eligible for trading.
+
+        CRITICAL: This is the authoritative check before any trade.
+        """
+        if not server._worklist_available or not server._worklist_pipeline:
+            return {"tradeable": False, "reason": "Worklist not available"}
+
+        is_tradeable = server._worklist_pipeline.is_tradeable(symbol.upper())
+        return {
+            "symbol": symbol.upper(),
+            "tradeable": is_tradeable,
+            "reason": "passed_scrutiny" if is_tradeable else "not_in_worklist_or_failed_checks",
+        }
+
+    @app.post("/api/worklist/reset")
+    async def reset_worklist_session():
+        """
+        Reset worklist for new session.
+
+        Archives current worklist and creates fresh one for today.
+        """
+        if not server._worklist_available or not server._worklist_pipeline:
+            return {"error": "Worklist not available"}
+
+        summary = await server._worklist_pipeline.reset_session()
+        return {
+            "success": True,
+            **summary,
+        }
+
     @app.get("/api/pipeline/events")
     async def get_pipeline_events(limit: int = 50, event_type: str | None = None):
         """Get recent pipeline events for monitoring."""
@@ -2462,6 +3286,48 @@ def create_app() -> FastAPI:
             "scanner": scanner_stats,
             "watchlist": watchlist_stats,
         }
+
+    @app.get("/api/scanner/health")
+    async def get_scanner_health():
+        """
+        MAX_AI Scanner Health Contract (Deliverable 6).
+
+        Comprehensive health check for scanner integration.
+        Use this to verify scanner is working before relying on it.
+        """
+        health = {
+            "scanner_available": server._scanner_available,
+            "scanner_healthy": False,
+            "integration_running": False,
+            "symbols_discovered": 0,
+            "halts_tracked": 0,
+            "last_error": None,
+            "contract": {
+                "source": "MAX_AI_SCANNER",
+                "url": "http://127.0.0.1:8787",
+                "role": "SYMBOL_DISCOVERY_ONLY",
+                "overlap_allowed": False,
+            },
+        }
+
+        if hasattr(server, '_scanner_integration') and server._scanner_integration:
+            integration = server._scanner_integration
+            health["integration_running"] = integration.is_healthy()
+            status = integration.get_status()
+            health["scanner_healthy"] = status.get("scanner_healthy", False)
+            health["symbols_discovered"] = len(status.get("active_symbols", []))
+            health["halts_tracked"] = len(status.get("known_halts", []))
+            health["config"] = status.get("config", {})
+            health["active_symbols"] = status.get("active_symbols", [])
+
+        # Overall health assessment
+        health["overall_status"] = (
+            "HEALTHY" if health["scanner_healthy"] and health["integration_running"]
+            else "DEGRADED" if health["scanner_available"]
+            else "UNAVAILABLE"
+        )
+
+        return health
 
     @app.get("/api/scanner/watchlist")
     async def get_watchlist():
@@ -2760,6 +3626,15 @@ def create_app() -> FastAPI:
 
         await server.inject_signal(symbol.upper(), direction, entry_price)
         return {"status": "signal_injected", "symbol": symbol.upper()}
+
+    @app.post("/api/watchlist/purge")
+    async def purge_watchlist():
+        """Manually trigger daily watchlist purge (for fresh start)."""
+        try:
+            await server._purge_watchlist_for_new_day()
+            return {"success": True, "message": "Watchlist purged for fresh daily movers"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     return app
 
