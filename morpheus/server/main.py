@@ -565,12 +565,35 @@ class MorpheusServer:
             logger.info(f"  - Post-halt cooldown: {microstructure_config.post_halt_cooldown_seconds}s")
             logger.info(f"  - HTB short haircut: {microstructure_config.htb_short_size_haircut:.0%}")
 
+            # Initialize Momentum Engine (optional — additive only)
+            self._momentum_engine = None
+            try:
+                from morpheus.ai.momentum_engine import MomentumEngine
+
+                async def _on_momentum_state_change(snapshot):
+                    """Emit momentum state change as event."""
+                    await self.emit_event(create_event(
+                        EventType.MOMENTUM_STATE_CHANGE,
+                        payload=snapshot.to_dict(),
+                        symbol=snapshot.symbol,
+                    ))
+
+                self._momentum_engine = MomentumEngine(
+                    on_state_change=lambda snap: asyncio.create_task(
+                        _on_momentum_state_change(snap)
+                    ),
+                )
+                logger.info("[MOMENTUM] Momentum engine initialized")
+            except Exception as e:
+                logger.warning(f"[MOMENTUM] Momentum engine not available: {e}")
+
             # Create pipeline with emit callback
             self._pipeline = SignalPipeline(
                 config=config,
                 emit_event=self.emit_event,  # Wire to server's event emission
                 mass_config=mass_config,
                 position_manager=self._paper_position_manager,
+                momentum_engine=self._momentum_engine,
             )
             self._pipeline_available = True
             logger.info("Signal pipeline initialized successfully (FULL MASS + RISK)")
@@ -2164,6 +2187,16 @@ class MorpheusServer:
                         if self._microstructure_gates and 'micro_result' in dir():
                             disable_trailing = micro_result.disable_trailing
 
+                        # Extract momentum intelligence from pipeline features
+                        features_data = (
+                            payload.get("gate_result", {})
+                            .get("scored_signal", {})
+                            .get("feature_snapshot", {})
+                        )
+                        entry_momentum_score = features_data.get("momentum_engine_score", 0.0)
+                        entry_momentum_state = features_data.get("momentum_engine_state_str", "UNKNOWN")
+                        entry_confidence_raw = features_data.get("momentum_engine_confidence", 0.0)
+
                         # Store validated exit plan for position manager
                         self._paper_position_manager.set_signal_metadata(symbol, {
                             "strategy_name": strategy_name,
@@ -2183,6 +2216,12 @@ class MorpheusServer:
                             "ssr_active_at_entry": ssr_active,
                             "htb_at_entry": htb_active,
                             "disable_trailing": disable_trailing,
+                            # Momentum intelligence
+                            "entry_momentum_score": entry_momentum_score,
+                            "entry_momentum_state": entry_momentum_state,
+                            "entry_confidence": entry_confidence_raw,
+                            "entry_reference": signal_data.get("entry_reference", entry_price),
+                            "signal_timestamp": signal_data.get("timestamp", ""),
                         })
 
                         partial_str = f" partial={exit_plan.partial_take_pct:.0%}@{exit_plan.partial_trigger_pct:.1%}" if exit_plan.allow_partial_take else ""
@@ -3282,6 +3321,30 @@ def create_app() -> FastAPI:
         }
 
     # ========================================================================
+    # Momentum Intelligence API
+    # ========================================================================
+
+    @app.get("/api/momentum/status")
+    async def get_momentum_status():
+        """Get momentum engine status and all tracked symbols."""
+        if not server._momentum_engine:
+            return {"enabled": False, "message": "Momentum engine not available"}
+        return {
+            "enabled": True,
+            **server._momentum_engine.status(),
+        }
+
+    @app.get("/api/momentum/{symbol}")
+    async def get_momentum_symbol(symbol: str):
+        """Get detailed momentum snapshot for a specific symbol."""
+        if not server._momentum_engine:
+            return {"error": "Momentum engine not available"}
+        snap = server._momentum_engine.get_snapshot(symbol.upper())
+        if snap is None:
+            return {"symbol": symbol.upper(), "status": "no_data"}
+        return snap.to_dict()
+
+    # ========================================================================
     # Microstructure Gates API
     # ========================================================================
 
@@ -4099,6 +4162,55 @@ def create_app() -> FastAPI:
             return {"success": True, "message": "Watchlist purged for fresh daily movers"}
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    # ========================================================================
+    # Reporting Parity Stubs (IBKR interface — not yet implemented)
+    # ========================================================================
+
+    @app.get("/api/momentum/snapshot/{symbol}")
+    async def momentum_snapshot_stub(symbol: str):
+        """IBKR-parity stub: detailed momentum snapshot with components."""
+        return {"status": "not_implemented", "symbol": symbol}
+
+    @app.get("/api/execution/status")
+    async def execution_status_stub():
+        """IBKR-parity stub: ExecutionManager status."""
+        return {"status": "not_implemented", "note": "ExecutionManager not yet ported"}
+
+    @app.get("/api/execution/records")
+    async def execution_records_stub():
+        """IBKR-parity stub: execution records with latency/slippage."""
+        return {"status": "not_implemented"}
+
+    @app.get("/api/execution/latency")
+    async def execution_latency_stub():
+        """IBKR-parity stub: execution latency percentiles."""
+        return {"status": "not_implemented"}
+
+    @app.get("/api/variance/status")
+    async def variance_status_stub():
+        """IBKR-parity stub: VarianceAnalyzer status."""
+        return {"status": "not_implemented", "note": "VarianceAnalyzer not yet ported"}
+
+    @app.get("/api/variance/top-failures")
+    async def variance_top_failures_stub():
+        """IBKR-parity stub: top variance failures."""
+        return {"status": "not_implemented"}
+
+    @app.get("/api/reports/eod/today")
+    async def reports_eod_today_stub():
+        """IBKR-parity stub: today's EOD report (structured 12-section format)."""
+        return {"status": "not_implemented"}
+
+    @app.get("/api/reports/weekly")
+    async def reports_weekly_stub():
+        """IBKR-parity stub: weekly report."""
+        return {"status": "not_implemented", "note": "WeeklyReportGenerator not yet ported"}
+
+    @app.get("/api/reports/weekly/{end_date}")
+    async def reports_weekly_date_stub(end_date: str):
+        """IBKR-parity stub: weekly report for specific end date."""
+        return {"status": "not_implemented", "end_date": end_date}
 
     return app
 
