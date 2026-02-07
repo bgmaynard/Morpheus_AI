@@ -50,6 +50,12 @@ from morpheus.risk.kill_switch import (
     create_conservative_kill_switch,
     create_aggressive_kill_switch,
 )
+from morpheus.risk.microstructure_gates import (
+    GateDecision,
+    GateResult,
+    MicrostructureResult,
+    MicrostructureGates,
+)
 
 __all__ = [
     # Base
@@ -97,4 +103,9 @@ __all__ = [
     "create_kill_switch",
     "create_conservative_kill_switch",
     "create_aggressive_kill_switch",
+    # Microstructure Gates
+    "GateDecision",
+    "GateResult",
+    "MicrostructureResult",
+    "MicrostructureGates",
 ]

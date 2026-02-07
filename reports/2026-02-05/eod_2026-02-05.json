@@ -1,0 +1,108 @@
+{
+  "report_date": "2026-02-05",
+  "generated_at": "2026-02-05T16:30:00+00:00",
+  "summary": {
+    "signals_detected": 9298,
+    "signals_approved": 9101,
+    "signals_rejected": 7428,
+    "approval_rate": 97.9,
+    "risk_approved": 1870,
+    "risk_approval_rate": 20.6,
+    "trades_executed": 0,
+    "trades_shadow": 0,
+    "trades_won": 0,
+    "trades_lost": 0,
+    "win_rate": 0
+  },
+  "pnl": {
+    "total": 0.0,
+    "avg_per_trade": 0.0,
+    "best": 0.0,
+    "worst": 0.0,
+    "max_drawdown": 0.0
+  },
+  "execution_quality": {
+    "avg_slippage": null,
+    "avg_spread": null,
+    "avg_hold_time_seconds": null
+  },
+  "execution_blocks": {
+    "total": 1870,
+    "breakdown": [
+      {"reason": "SCANNER_STALE", "count": 1732, "percentage": 92.6},
+      {"reason": "NOT_IN_WORKLIST", "count": 92, "percentage": 4.9},
+      {"reason": "SCANNER_OFFLINE", "count": 46, "percentage": 2.5}
+    ]
+  },
+  "risk_vetoes": {
+    "total": 7231,
+    "breakdown": [
+      {"reason": "insufficient_room_to_profit", "count": 4314, "percentage": 59.7},
+      {"reason": "regime_position_limit", "count": 2403, "percentage": 33.2},
+      {"reason": "symbol_cooldown", "count": 383, "percentage": 5.3},
+      {"reason": "symbol_cooldown+regime_position_limit", "count": 131, "percentage": 1.8}
+    ]
+  },
+  "signals_by_strategy": [
+    {"strategy": "gap_fade", "count": 4729, "percentage": 50.9, "direction": "short"},
+    {"strategy": "catalyst_momentum", "count": 2195, "percentage": 23.6, "direction": "long"},
+    {"strategy": "vwap_reclaim", "count": 1389, "percentage": 14.9, "direction": "long"},
+    {"strategy": "day2_continuation", "count": 426, "percentage": 4.6, "direction": "long"},
+    {"strategy": "order_flow_scalp", "count": 312, "percentage": 3.4, "direction": "mixed"},
+    {"strategy": "premarket_breakout", "count": 159, "percentage": 1.7, "direction": "long"},
+    {"strategy": "first_pullback", "count": 52, "percentage": 0.6, "direction": "long"},
+    {"strategy": "short_squeeze", "count": 35, "percentage": 0.4, "direction": "long"},
+    {"strategy": "hod_continuation", "count": 1, "percentage": 0.01, "direction": "long"}
+  ],
+  "direction_breakdown": {
+    "short": 5640,
+    "long": 3658,
+    "short_percentage": 60.7,
+    "long_percentage": 39.3
+  },
+  "signals_by_hour_et": [
+    {"hour": 7, "count": 25},
+    {"hour": 8, "count": 169},
+    {"hour": 9, "count": 1076},
+    {"hour": 10, "count": 1545},
+    {"hour": 11, "count": 1506},
+    {"hour": 12, "count": 1490},
+    {"hour": 13, "count": 1210},
+    {"hour": 14, "count": 880},
+    {"hour": 15, "count": 1396},
+    {"hour": 16, "count": 1}
+  ],
+  "top_symbols": [
+    {"symbol": "SNAP", "signals": 2546},
+    {"symbol": "CISS", "signals": 2438},
+    {"symbol": "BYAH", "signals": 1824},
+    {"symbol": "NIO", "signals": 1798},
+    {"symbol": "MOBX", "signals": 1724},
+    {"symbol": "ELPW", "signals": 1424},
+    {"symbol": "LIMN", "signals": 1202},
+    {"symbol": "EGHT", "signals": 1012},
+    {"symbol": "DHX", "signals": 1002},
+    {"symbol": "BOXL", "signals": 990}
+  ],
+  "top_issues": [
+    "SCANNER_STALE (92.6% of execution blocks) - MAX_AI scanner data not refreshing",
+    "insufficient_room_to_profit (59.7% of risk vetoes) - Spread thresholds too tight",
+    "regime_position_limit (33.2% of risk vetoes) - DEAD regime blocking trades",
+    "Short bias (60.7%) - gap_fade strategy dominating",
+    "Zero trade execution - No real P&L data to learn from"
+  ],
+  "market_context": {
+    "regime_summary": "CHOP (primary), DEAD (periods)",
+    "market_mode": "RTH",
+    "active_symbols": 21
+  },
+  "event_log_stats": {
+    "total_events": 606623,
+    "log_size_mb": 486,
+    "quote_updates": 98484,
+    "feature_computations": 110813,
+    "structure_classifications": 114552,
+    "heartbeats": 14260
+  },
+  "trades": []
+}

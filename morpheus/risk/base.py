@@ -52,6 +52,17 @@ class VetoReason(Enum):
     STRATEGY_RISK_EXCEEDED = "strategy_risk_exceeded"
     POSITION_ALREADY_OPEN = "position_already_open"
 
+    # Microstructure gate veto reasons
+    DATA_STALE_PREVENTED = "data_stale_prevented"       # Stale quote data
+    HALT_ACTIVE = "halt_active"                         # Symbol is halted
+    POST_HALT_COOLDOWN = "post_halt_cooldown"           # In post-halt cooldown
+    POST_HALT_UNSTABLE = "post_halt_unstable"           # Post-halt stability checks failed
+    NTB_BLOCK_SHORT = "ntb_block_short"                 # Cannot short NTB stock
+    HTB_BLOCK_MARKET_SHORT = "htb_block_market_short"   # No market shorts on HTB
+    HTB_BLOCK_GTC_SHORT = "htb_block_gtc_short"         # No GTC shorts on HTB
+    SSR_ENTRY_TIGHTENED = "ssr_entry_tightened"         # SSR entry conditions not met
+    SSR_LATE_EXTENSION = "ssr_late_extension"           # SSR blocking late entry
+
 
 class RiskDecision(Enum):
     """Risk evaluation decision outcomes."""
@@ -148,6 +159,9 @@ class AccountState:
     # Risk state
     kill_switch_active: bool = False
     manual_halt: bool = False
+
+    # Paper mode indicator (Deliverable 3 - Paper Mode Isolation)
+    is_paper_mode: bool = True  # True when data comes from paper position manager
 
     # Timestamp
     as_of: datetime = field(default_factory=lambda: datetime.now(timezone.utc))

@@ -48,17 +48,17 @@ class RiskManagerConfig:
     """
 
     # Position limits
-    max_open_positions: int = 5
+    max_open_positions: int = 30  # Raised for paper trading with real positions
     max_position_pct: float = 0.10  # 10% max in single position
 
     # Exposure limits
-    max_total_exposure_pct: float = 0.50  # 50% max total exposure
+    max_total_exposure_pct: float = 0.90  # 90% max total exposure (raised for paper testing)
 
     # Daily loss limits
-    max_daily_loss_pct: float = 0.03  # 3% max daily loss
+    max_daily_loss_pct: float = 100.0  # 10000% - effectively disabled for paper testing
 
     # Drawdown limits
-    max_drawdown_pct: float = 0.10  # 10% max drawdown
+    max_drawdown_pct: float = 100.0  # 10000% - effectively disabled for paper testing
 
     # Buying power check
     min_buying_power_pct: float = 0.10  # Keep 10% buying power reserve

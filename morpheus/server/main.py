@@ -21,7 +21,7 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +104,27 @@ except ImportError as e:
 
 # Paper position manager (exit management + position tracking)
 from morpheus.execution.paper_position_manager import PaperPositionManager, ExitPlan
+
+# Microstructure gates (halt/borrow/SSR status + data staleness)
+from morpheus.core.symbol_state import (
+    SymbolStateManager,
+    MicrostructureConfig,
+    SecurityStatus,
+    BorrowStatus,
+)
+from morpheus.risk.microstructure_gates import MicrostructureGates
+
+# Validation mode (microstructure correctness testing)
+from morpheus.core.validation_mode import (
+    ValidationModeConfig,
+    init_validation_mode,
+    get_validation_config,
+    get_validation_counters,
+    get_validation_logger,
+    is_validation_mode,
+    reset_validation_counters,
+    get_validation_summary,
+)
 
 # Worklist pipeline (symbol intake, scrutiny, scoring)
 try:
@@ -342,6 +363,10 @@ class MorpheusServer:
         # Paper position manager (exit management + position tracking)
         self._paper_position_manager: PaperPositionManager | None = None
 
+        # Microstructure gates (halt/borrow/SSR status + data staleness)
+        self._symbol_state_manager: SymbolStateManager | None = None
+        self._microstructure_gates: MicrostructureGates | None = None
+
         # Worklist pipeline (symbol intake, scrutiny, scoring)
         self._worklist_pipeline: WorklistPipeline | None = None
         self._worklist_available = False
@@ -502,6 +527,44 @@ class MorpheusServer:
             logger.info("[EXIT_MGR] Exit Management v1 initialized")
             logger.info("[EXIT_MGR] All trades require valid exit plan (TIME_STOP, HARD_STOP, TRAIL_STOP)")
 
+            # Initialize validation mode (microstructure correctness testing)
+            validation_config = ValidationModeConfig(
+                enabled=True,  # Enable validation mode
+                max_concurrent_positions=1,
+                max_notional_exposure=500.0,
+                max_trades_per_phase={"PREMARKET": 3, "RTH": 5, "AFTER_HOURS": 0},
+                allowed_strategies=[
+                    "catalyst_momentum", "first_pullback", "vwap_reclaim",
+                    "order_flow_scalp", "hod_continuation", "day2_continuation",
+                    "coil_breakout", "short_squeeze",
+                ],
+                premarket_allowed_strategies=["premarket_breakout", "catalyst_momentum", "first_pullback"],
+                allow_shorts=False,
+                trading_end=time(16, 0),  # RTH window extends to 4:00 PM ET
+            )
+            init_validation_mode(validation_config)
+
+            # Create microstructure gates (halt/borrow/SSR + data staleness)
+            microstructure_config = MicrostructureConfig(
+                stale_quote_seconds=get_runtime_config().max_quote_age_ms / 1000.0,  # Convert ms to seconds
+                post_halt_cooldown_seconds=60.0,
+                htb_short_size_haircut=0.5,
+                htb_room_to_profit_relaxation=0.15,
+            )
+            self._symbol_state_manager = SymbolStateManager(
+                config=microstructure_config,
+                emit_event=self.emit_event,
+            )
+            self._microstructure_gates = MicrostructureGates(
+                state_manager=self._symbol_state_manager,
+                config=microstructure_config,
+                emit_event=self.emit_event,
+            )
+            logger.info("[MICROSTRUCTURE] Symbol state manager + gates initialized")
+            logger.info(f"  - Stale quote threshold: {microstructure_config.stale_quote_seconds}s")
+            logger.info(f"  - Post-halt cooldown: {microstructure_config.post_halt_cooldown_seconds}s")
+            logger.info(f"  - HTB short haircut: {microstructure_config.htb_short_size_haircut:.0%}")
+
             # Create pipeline with emit callback
             self._pipeline = SignalPipeline(
                 config=config,
@@ -646,8 +709,9 @@ class MorpheusServer:
                     on_event=self._handle_scanner_event,
                     on_symbol_discovered=self._handle_scanner_symbol_discovered,
                     on_symbol_removed=self._handle_scanner_symbol_removed,
+                    on_heartbeat=self._handle_scanner_heartbeat,
                 )
-                logger.info("Scanner Integration initialized (events + halts)")
+                logger.info("Scanner Integration initialized (events + halts + heartbeat)")
 
                 # Wire scanner context to pipeline for external augmentation
                 # This allows FeatureContext to include scanner_score, gap_pct, etc.
@@ -904,7 +968,12 @@ class MorpheusServer:
             # This is the gatekeeper - only symbols that pass scrutiny enter the worklist
             worklist_entry = None
             if self._worklist_available and self._worklist_pipeline:
-                scanner_score = scanner_context.get("scanner_score", 50.0) or scanner_context.get("ai_score", 50.0) or 50.0
+                # Get scanner score - normalize from 0-1 to 0-100 scale if needed
+                raw_score = scanner_context.get("scanner_score") or scanner_context.get("ai_score") or 0.5
+                # MAX_AI returns scores in 0-1 range, scrutiny expects 0-100
+                scanner_score = raw_score * 100 if raw_score <= 1.0 else raw_score
+                scanner_score = max(scanner_score, 50.0)  # Default minimum if no score
+
                 gap_pct = scanner_context.get("gap_pct", 0.0) or 0.0
                 rvol = scanner_context.get("rvol", 1.0) or scanner_context.get("rvol_proxy", 1.0) or 1.0
                 volume = scanner_context.get("volume", 0) or scanner_context.get("totalVolume", 0) or 0
@@ -1009,6 +1078,22 @@ class MorpheusServer:
         except Exception as e:
             logger.error(f"Error handling removed symbol {symbol}: {e}")
 
+    async def _handle_scanner_heartbeat(self, active_count: int) -> None:
+        """
+        Handle scanner heartbeat - fires on EVERY successful poll.
+
+        This keeps the scanner timestamp fresh even when no new symbols
+        are discovered, preventing false "scanner stale" blocks.
+        """
+        # Update scanner health timestamp on every successful poll
+        self.state.last_scanner_update = datetime.now(timezone.utc)
+        self.state.scanner_health_ok = True
+
+        # Log periodically (not every heartbeat to avoid log spam)
+        # Only log if there are active symbols
+        if active_count > 0:
+            logger.debug(f"[SCANNER] Heartbeat: {active_count} active symbols")
+
     async def _handle_aggregated_candle(self, symbol: str, ohlcv: OHLCV, timestamp: datetime) -> None:
         """Handle completed 1-min candle from aggregator."""
         if not self._pipeline_available or not self._pipeline:
@@ -1076,6 +1161,22 @@ class MorpheusServer:
                     if quote.close_price and quote.close_price > 0 else 0
                 ),
             }
+
+            # Update symbol state for microstructure gates
+            if self._symbol_state_manager:
+                spread_pct = None
+                if quote.bid_price and quote.ask_price and quote.bid_price > 0:
+                    spread_pct = (quote.ask_price - quote.bid_price) / quote.bid_price
+                self._symbol_state_manager.update_quote(
+                    symbol=quote.symbol,
+                    last_price=price,
+                    bid=quote.bid_price,
+                    ask=quote.ask_price,
+                    spread_pct=spread_pct,
+                )
+                # Set prior close for SSR calculation
+                if quote.close_price and quote.close_price > 0:
+                    self._symbol_state_manager.set_prior_close(quote.symbol, quote.close_price)
 
             # Feed quote to candle aggregator (builds 1-min candles)
             if self._candle_aggregator:
@@ -1353,15 +1454,15 @@ class MorpheusServer:
 
     async def _daily_reset_loop(self):
         """Background loop that purges watchlist at 4:00 AM ET daily for fresh movers."""
-        from morpheus.core.market_mode import get_time_et
+        from morpheus.core.market_mode import ET as ET_TZ
         logger.info("[DAILY_RESET] Daily reset daemon started (purges watchlist at 4:00 AM ET)")
         while True:
             try:
                 await asyncio.sleep(60)  # Check every minute
-                now_et = get_time_et()
+                now_et = datetime.now(ET_TZ)
 
-                # Check if it's 4:15 AM ET (after morning scheduled task)
-                if now_et.hour == 4 and now_et.minute == 15:
+                # Check if it's 4:00 AM ET (morning reset time)
+                if now_et.hour == 4 and now_et.minute == 0:
                     # Only reset once per day
                     today = now_et.date()
                     if self._last_daily_reset is None or self._last_daily_reset.date() != today:
@@ -1379,10 +1480,17 @@ class MorpheusServer:
     async def _purge_watchlist_for_new_day(self):
         """Clear watchlist, pipeline symbols, and streaming subscriptions for fresh start."""
         try:
+            logger.info("[DAILY_RESET] Starting daily purge...")
+
             # Clear watchlist
             if self._watchlist:
                 self._watchlist.reset()
                 logger.info("[DAILY_RESET] Watchlist cleared")
+
+            # Clear worklist pipeline (THIS WAS MISSING!)
+            if self._worklist_available and self._worklist_pipeline:
+                reset_worklist_pipeline()
+                logger.info("[DAILY_RESET] Worklist pipeline reset")
 
             # Clear pipeline symbols
             if self._pipeline_available and self._pipeline:
@@ -1415,6 +1523,19 @@ class MorpheusServer:
                 self._paper_position_manager.reset_daily()
                 logger.info("[DAILY_RESET] Paper position manager daily stats reset")
 
+            # Reset microstructure gates daily stats
+            if self._symbol_state_manager:
+                self._symbol_state_manager.reset_daily()
+                logger.info("[DAILY_RESET] Symbol state manager daily stats reset")
+            if self._microstructure_gates:
+                self._microstructure_gates.reset_daily()
+                logger.info("[DAILY_RESET] Microstructure gates daily stats reset")
+
+            # Reset validation mode counters
+            if is_validation_mode():
+                reset_validation_counters()
+                logger.info("[DAILY_RESET] Validation mode counters reset")
+
             # Emit event
             await self.emit_event(create_event(
                 EventType.SYSTEM_STATUS,
@@ -1426,6 +1547,26 @@ class MorpheusServer:
 
     async def start(self):
         """Start background tasks."""
+
+        # ══════════════════════════════════════════════════════════════════
+        # STARTUP PURGE: Clear stale data on first premarket startup of day
+        # This ensures fresh session even if 4:00 AM purge was missed
+        # ══════════════════════════════════════════════════════════════════
+        from morpheus.core.market_mode import ET
+        now_et = datetime.now(ET)
+        today = now_et.date()
+
+        # Check if we should purge on startup (premarket window: 4:00 AM - 9:30 AM ET)
+        # Only purge if we haven't already done it today
+        if 4 <= now_et.hour < 10:  # Premarket window
+            if self._last_daily_reset is None or self._last_daily_reset.date() != today:
+                logger.info(f"[STARTUP] Premarket startup at {now_et.strftime('%H:%M')} ET - purging stale data")
+                await self._purge_watchlist_for_new_day()
+                self._last_daily_reset = now_et
+                logger.info("[STARTUP] Startup purge complete - fresh session ready")
+            else:
+                logger.info(f"[STARTUP] Already purged today at {self._last_daily_reset.strftime('%H:%M')} ET - skipping")
+
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self._trading_data_task = asyncio.create_task(self._trading_data_loop())
 
@@ -1709,6 +1850,161 @@ class MorpheusServer:
                 shares = pos_size.get("shares", 100)
                 entry_price = float(pos_size.get("entry_price", 0))
 
+                # Extract signal metadata for gate checks
+                signal_data = (
+                    payload.get("gate_result", {})
+                    .get("scored_signal", {})
+                    .get("signal", {})
+                )
+                direction = signal_data.get("direction", "long")
+                strategy_name = signal_data.get("strategy_name", "unknown")
+
+                # ══════════════════════════════════════════════════════════════
+                # VALIDATION MODE: Hard safety constraints for correctness testing
+                # ══════════════════════════════════════════════════════════════
+                if is_validation_mode():
+                    val_config = get_validation_config()
+                    val_logger = get_validation_logger()
+                    val_counters = get_validation_counters()
+
+                    # Check 1: Strategy allowed? (phase-aware)
+                    from morpheus.core.market_mode import get_market_phase, MarketPhase
+                    current_phase = get_market_phase()
+                    if current_phase == MarketPhase.PREMARKET:
+                        phase_strategies = val_config.premarket_allowed_strategies
+                    else:
+                        phase_strategies = val_config.allowed_strategies
+                    if strategy_name.lower() not in [s.lower() for s in phase_strategies]:
+                        if val_logger:
+                            val_logger.log_trade_blocked_strategy(symbol, strategy_name)
+                        logger.warning(
+                            f"[VALIDATION] BLOCKED: {symbol} strategy={strategy_name} "
+                            f"not in {current_phase.value}_strategies={phase_strategies}"
+                        )
+                        return
+
+                    # Check 2: Direction allowed?
+                    if direction == "short" and not val_config.allow_shorts:
+                        if val_logger:
+                            val_logger.log_trade_blocked_strategy(symbol, f"short_{strategy_name}")
+                        logger.warning(f"[VALIDATION] BLOCKED: {symbol} shorts disabled during validation")
+                        return
+
+                    # Check 3: Phase-scoped trade cap?
+                    phase_name = current_phase.value
+                    phase_cap = val_config.max_trades_per_phase.get(phase_name, 0)
+                    phase_used = val_counters.trades_by_phase.get(phase_name, 0) if val_counters else 0
+                    if val_counters and phase_used >= phase_cap:
+                        val_counters.trades_blocked_phase_cap[phase_name] = (
+                            val_counters.trades_blocked_phase_cap.get(phase_name, 0) + 1
+                        )
+                        logger.warning(
+                            f"[VALIDATION] BLOCKED: {symbol} {phase_name} cap reached "
+                            f"({phase_used}/{phase_cap})"
+                        )
+                        await self.emit_event(create_event(
+                            EventType.EXECUTION_BLOCKED,
+                            payload={
+                                "symbol": symbol,
+                                "block_reasons": ["VALIDATION_PHASE_CAP_REACHED"],
+                                "phase": phase_name,
+                                "cap": phase_cap,
+                                "used": phase_used,
+                            },
+                            symbol=symbol,
+                        ))
+                        return
+
+                    # Check 4: Position limit?
+                    if self._paper_position_manager:
+                        open_positions = len(self._paper_position_manager.get_positions_summary())
+                        if open_positions >= val_config.max_concurrent_positions:
+                            if val_logger:
+                                val_logger.log_trade_blocked_position_limit(symbol, open_positions)
+                            logger.warning(
+                                f"[VALIDATION] BLOCKED: {symbol} max_concurrent_positions "
+                                f"({val_config.max_concurrent_positions}) reached"
+                            )
+                            return
+
+                    # Check 5: Notional exposure limit?
+                    notional = shares * entry_price
+                    if notional > val_config.max_notional_exposure:
+                        original_shares = shares
+                        shares = max(1, int(val_config.max_notional_exposure / entry_price))
+                        logger.info(
+                            f"[VALIDATION] {symbol} size reduced for notional limit: "
+                            f"{original_shares} -> {shares} shares (${notional:.2f} -> ${shares * entry_price:.2f})"
+                        )
+
+                    # Check 6: Trading time window? (phase-aware)
+                    from morpheus.core.market_mode import ET as ET_TZ
+                    current_time = datetime.now(ET_TZ).time()
+                    if current_phase == MarketPhase.PREMARKET:
+                        window_start = val_config.premarket_start
+                        window_end = val_config.premarket_end
+                    else:
+                        window_start = val_config.trading_start
+                        window_end = val_config.trading_end
+                    if not (window_start <= current_time <= window_end):
+                        if val_logger:
+                            val_logger.log_trade_blocked_time_window(symbol, str(current_time))
+                        logger.warning(
+                            f"[VALIDATION] BLOCKED: {symbol} outside {current_phase.value} window "
+                            f"{window_start}-{window_end} (current={current_time})"
+                        )
+                        return
+
+                # ══════════════════════════════════════════════════════════════
+                # MICROSTRUCTURE GATES: Check halt/borrow/SSR/staleness FIRST
+                # This prevents the "approve then block" pattern from EOD
+                # ══════════════════════════════════════════════════════════════
+                if self._microstructure_gates:
+                    # Get current quote for spread check
+                    quote = self.get_quote(symbol)
+                    spread_pct = None
+                    if quote:
+                        bid = float(quote.get("bid", 0))
+                        ask = float(quote.get("ask", 0))
+                        if bid > 0 and ask > 0:
+                            spread_pct = (ask - bid) / bid
+
+                    # Run all microstructure gate checks
+                    micro_result = await self._microstructure_gates.check_entry(
+                        symbol=symbol,
+                        direction=direction,
+                        order_type="LIMIT",
+                        time_in_force="DAY",
+                        spread_pct=spread_pct,
+                    )
+
+                    if not micro_result.passed:
+                        veto_reason = micro_result.veto_reason.value if micro_result.veto_reason else "MICROSTRUCTURE_BLOCK"
+                        logger.warning(
+                            f"[AUTO-TRADE] MICROSTRUCTURE BLOCKED: {symbol} - "
+                            f"{veto_reason}: {micro_result.veto_details}"
+                        )
+                        await self.emit_event(create_event(
+                            EventType.EXECUTION_BLOCKED,
+                            payload={
+                                "symbol": symbol,
+                                "block_reasons": [veto_reason],
+                                "details": micro_result.veto_details,
+                                "gates_checked": micro_result.gates_checked,
+                            },
+                            symbol=symbol,
+                        ))
+                        return
+
+                    # Apply any modifications from gates
+                    if micro_result.final_size_multiplier < 1.0:
+                        original_shares = shares
+                        shares = max(1, int(shares * micro_result.final_size_multiplier))
+                        logger.info(
+                            f"[MICROSTRUCTURE] {symbol} size reduced: "
+                            f"{original_shares} -> {shares} ({micro_result.final_size_multiplier:.0%})"
+                        )
+
                 # SCANNER HEALTH CHECK: No auto-trading if scanner is stale
                 # This prevents trades when MAX_AI is down or stalled
                 if self.state.last_scanner_update:
@@ -1856,6 +2152,18 @@ class MorpheusServer:
                             ))
                             return  # DO NOT TRADE
 
+                        # Get microstructure flags for position
+                        ssr_active = False
+                        htb_active = False
+                        disable_trailing = False
+                        if self._symbol_state_manager:
+                            sym_state = self._symbol_state_manager.get(symbol)
+                            if sym_state:
+                                ssr_active = sym_state.ssr_active
+                                htb_active = sym_state.borrow_status == BorrowStatus.HTB
+                        if self._microstructure_gates and 'micro_result' in dir():
+                            disable_trailing = micro_result.disable_trailing
+
                         # Store validated exit plan for position manager
                         self._paper_position_manager.set_signal_metadata(symbol, {
                             "strategy_name": strategy_name,
@@ -1867,20 +2175,52 @@ class MorpheusServer:
                             "max_hold_seconds": exit_plan.max_hold_seconds,
                             "trail_activation_pct": exit_plan.trail_activation_pct,
                             "trail_distance_pct": exit_plan.trail_distance_pct,
+                            # Partial profit-take parameters
+                            "allow_partial_take": exit_plan.allow_partial_take,
+                            "partial_take_pct": exit_plan.partial_take_pct,
+                            "partial_trigger_pct": exit_plan.partial_trigger_pct,
+                            # Microstructure flags
+                            "ssr_active_at_entry": ssr_active,
+                            "htb_at_entry": htb_active,
+                            "disable_trailing": disable_trailing,
                         })
 
+                        partial_str = f" partial={exit_plan.partial_take_pct:.0%}@{exit_plan.partial_trigger_pct:.1%}" if exit_plan.allow_partial_take else ""
                         logger.info(
                             f"[EXIT_MGR] EXIT PLAN OK: {symbol} "
                             f"HARD_STOP=${exit_plan.hard_stop_price:.4f} "
                             f"max_hold={exit_plan.max_hold_seconds:.0f}s "
                             f"trail={exit_plan.trail_activation_pct:.1%}/{exit_plan.trail_distance_pct:.1%}"
+                            f"{partial_str}"
                         )
+
+                        # Emit EXIT_PROFILE_APPLIED event (strategy-aware tuning audit)
+                        await self.emit_event(create_event(
+                            EventType.EXIT_PROFILE_APPLIED,
+                            payload={
+                                "symbol": symbol,
+                                "strategy": strategy_name,
+                                "max_hold": exit_plan.max_hold_seconds,
+                                "trail_pct": exit_plan.trail_activation_pct,
+                                "allow_partial_take": exit_plan.allow_partial_take,
+                            },
+                            symbol=symbol,
+                        ))
 
                     logger.info(
                         f"[AUTO-TRADE] Paper auto-confirm: {symbol} "
                         f"{shares} shares @ ${entry_price:.2f} "
                         f"strategy={strategy_name}"
                     )
+
+                    # Log trade execution for validation mode
+                    if is_validation_mode():
+                        val_logger = get_validation_logger()
+                        if val_logger:
+                            from morpheus.core.market_mode import get_market_phase
+                            trade_phase = get_market_phase()
+                            val_logger.log_trade_executed(symbol, strategy_name, shares, entry_price, phase=trade_phase.value)
+
                     asyncio.create_task(
                         self._simulate_paper_order_sized(
                             symbol, entry_price, shares,
@@ -2941,6 +3281,113 @@ def create_app() -> FastAPI:
             },
         }
 
+    # ========================================================================
+    # Microstructure Gates API
+    # ========================================================================
+
+    @app.get("/api/microstructure/stats")
+    async def get_microstructure_stats():
+        """Get microstructure gate statistics."""
+        if not server._microstructure_gates:
+            return {"error": "Microstructure gates not available"}
+
+        stats = server._microstructure_gates.get_stats()
+        segments = server._microstructure_gates.get_eod_segments()
+        return {
+            "stats": stats,
+            "segments": segments,
+        }
+
+    @app.get("/api/microstructure/symbols")
+    async def get_microstructure_symbols():
+        """Get symbols by microstructure status."""
+        if not server._symbol_state_manager:
+            return {"error": "Symbol state manager not available"}
+
+        return {
+            "ssr": server._symbol_state_manager.get_ssr_symbols(),
+            "htb": server._symbol_state_manager.get_htb_symbols(),
+            "halted": server._symbol_state_manager.get_halted_symbols(),
+            "stale": server._symbol_state_manager.get_stale_symbols(),
+        }
+
+    @app.get("/api/microstructure/symbol/{symbol}")
+    async def get_symbol_state(symbol: str):
+        """Get microstructure state for a specific symbol."""
+        if not server._symbol_state_manager:
+            return {"error": "Symbol state manager not available"}
+
+        state = server._symbol_state_manager.get(symbol.upper())
+        if not state:
+            return {"error": f"No state for {symbol}"}
+
+        return state.to_dict()
+
+    @app.post("/api/microstructure/borrow/{symbol}")
+    async def set_borrow_status(symbol: str, status: str):
+        """Manually set borrow status for a symbol (ETB, HTB, NTB)."""
+        if not server._symbol_state_manager:
+            return {"error": "Symbol state manager not available"}
+
+        status = status.upper()
+        if status not in ("ETB", "HTB", "NTB"):
+            return {"error": f"Invalid status. Use: ETB, HTB, NTB"}
+
+        from morpheus.core.symbol_state import BorrowStatus, BorrowSource
+        borrow_status = BorrowStatus[status]
+        server._symbol_state_manager.update_borrow_status(
+            symbol.upper(), borrow_status, BorrowSource.MANUAL
+        )
+        logger.info(f"[MICROSTRUCTURE] Manual borrow status: {symbol} -> {status}")
+        return {"success": True, "symbol": symbol.upper(), "borrow_status": status}
+
+    @app.post("/api/microstructure/halt/{symbol}")
+    async def set_halt_status(symbol: str, halted: bool, halt_code: str | None = None):
+        """Manually set halt status for a symbol."""
+        if not server._symbol_state_manager:
+            return {"error": "Symbol state manager not available"}
+
+        server._symbol_state_manager.set_halt(symbol.upper(), halted, halt_code)
+        logger.info(f"[MICROSTRUCTURE] Manual halt status: {symbol} -> halted={halted}")
+        return {"success": True, "symbol": symbol.upper(), "halted": halted, "halt_code": halt_code}
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Validation Mode Endpoints
+    # ═══════════════════════════════════════════════════════════════════════
+
+    @app.get("/api/validation/status")
+    async def get_validation_status():
+        """Get validation mode status and counters."""
+        if not is_validation_mode():
+            return {"validation_mode": False, "message": "Validation mode is disabled"}
+
+        config = get_validation_config()
+        summary = get_validation_summary()
+        return {
+            "validation_mode": True,
+            "config": {
+                "max_concurrent_positions": config.max_concurrent_positions,
+                "max_notional_exposure": config.max_notional_exposure,
+                "max_trades_per_phase": config.max_trades_per_phase,
+                "allowed_strategies": config.allowed_strategies,
+                "premarket_allowed_strategies": config.premarket_allowed_strategies,
+                "allow_shorts": config.allow_shorts,
+                "rth_window": f"{config.trading_start}-{config.trading_end} ET",
+                "premarket_window": f"{config.premarket_start}-{config.premarket_end} ET",
+            },
+            "summary": summary,
+        }
+
+    @app.post("/api/validation/reset")
+    async def reset_validation():
+        """Reset validation counters."""
+        if not is_validation_mode():
+            return {"error": "Validation mode is disabled"}
+
+        reset_validation_counters()
+        logger.info("[VALIDATION] Counters manually reset via API")
+        return {"success": True, "message": "Validation counters reset"}
+
     @app.post("/api/mass/regime/override")
     async def override_regime_mode(mode: str = "HOT"):
         """
@@ -3393,6 +3840,23 @@ def create_app() -> FastAPI:
             if server._pipeline_available and server._pipeline:
                 server._pipeline.add_symbol(symbol)
                 asyncio.create_task(server._warmup_pipeline_symbol(symbol))
+
+            # Also add to worklist as ACTIVE with high score so trades can execute
+            if server._worklist_available and server._worklist_pipeline:
+                from morpheus.worklist.store import WorklistEntry
+                now_iso = datetime.now(timezone.utc).isoformat()
+                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                entry = WorklistEntry(
+                    symbol=symbol,
+                    session_date=today_str,
+                    first_seen_ts=now_iso,
+                    last_update_ts=now_iso,
+                    source="manual",
+                    combined_priority_score=100.0,  # Max score for manual force-add
+                    status="active",
+                )
+                server._worklist_pipeline._store.add(entry)
+                logger.info(f"[FORCE-ADD] {symbol} added to worklist as ACTIVE (score=100)")
 
             logger.info(f"[FORCE-ADD] {symbol} added directly to pipeline ({reason})")
             server._save_persistent_watchlist()

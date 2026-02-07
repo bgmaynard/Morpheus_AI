@@ -86,6 +86,7 @@ class ScannerIntegration:
         on_event: Optional[Callable[[Event], Awaitable[None]]] = None,
         on_symbol_discovered: Optional[Callable[[str], Awaitable[None]]] = None,
         on_symbol_removed: Optional[Callable[[str], Awaitable[None]]] = None,
+        on_heartbeat: Optional[Callable[[int], Awaitable[None]]] = None,
     ):
         """
         Initialize scanner integration.
@@ -95,11 +96,13 @@ class ScannerIntegration:
             on_event: Callback for emitting Morpheus events
             on_symbol_discovered: Callback when new symbol should be subscribed
             on_symbol_removed: Callback when symbol should be unsubscribed
+            on_heartbeat: Callback on every successful poll (passes active symbol count)
         """
         self.config = config or ScannerIntegrationConfig()
         self._on_event = on_event
         self._on_symbol_discovered = on_symbol_discovered
         self._on_symbol_removed = on_symbol_removed
+        self._on_heartbeat = on_heartbeat
 
         # Client
         self._client = MaxAIScannerClient()
@@ -115,6 +118,12 @@ class ScannerIntegration:
         self._symbol_task: Optional[asyncio.Task] = None
         self._halt_task: Optional[asyncio.Task] = None
         self._event_task: Optional[asyncio.Task] = None
+        self._health_task: Optional[asyncio.Task] = None
+
+        # Health monitoring
+        self._consecutive_failures: int = 0
+        self._max_consecutive_failures: int = 5
+        self._health_check_interval: float = 30.0  # Check health every 30s
 
     @property
     def active_symbols(self) -> Set[str]:
@@ -147,8 +156,9 @@ class ScannerIntegration:
         # Start polling loops
         self._symbol_task = asyncio.create_task(self._symbol_poll_loop())
         self._halt_task = asyncio.create_task(self._halt_poll_loop())
+        self._health_task = asyncio.create_task(self._health_monitor_loop())
 
-        logger.info("Scanner integration started")
+        logger.info("Scanner integration started with health monitoring")
 
     async def stop(self) -> None:
         """Stop the scanner integration."""
@@ -156,7 +166,7 @@ class ScannerIntegration:
         self._is_running = False
 
         # Cancel tasks
-        for task in [self._symbol_task, self._halt_task, self._event_task]:
+        for task in [self._symbol_task, self._halt_task, self._event_task, self._health_task]:
             if task:
                 task.cancel()
                 try:
@@ -191,21 +201,79 @@ class ScannerIntegration:
 
             await asyncio.sleep(self.config.halt_poll_interval)
 
+    async def _health_monitor_loop(self) -> None:
+        """Monitor scanner health and attempt reconnection if needed."""
+        while self._is_running:
+            try:
+                # Check scanner health
+                is_healthy = await self._client.health_check()
+
+                if is_healthy:
+                    if not self._scanner_healthy:
+                        logger.info("[SCANNER] Connection restored - scanner is healthy")
+                    self._scanner_healthy = True
+                    self._consecutive_failures = 0
+                else:
+                    self._consecutive_failures += 1
+                    logger.warning(
+                        f"[SCANNER] Health check failed "
+                        f"({self._consecutive_failures}/{self._max_consecutive_failures})"
+                    )
+
+                    if self._consecutive_failures >= self._max_consecutive_failures:
+                        self._scanner_healthy = False
+                        logger.error(
+                            "[SCANNER] Max consecutive failures reached - "
+                            "attempting to reconnect..."
+                        )
+                        # Close and recreate client
+                        await self._client.close()
+                        self._client = MaxAIScannerClient()
+                        self._consecutive_failures = 0
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Health monitor error: {e}")
+                self._consecutive_failures += 1
+
+            await asyncio.sleep(self._health_check_interval)
+
     async def _sync_symbols(self) -> None:
         """Fetch symbols from scanner and sync to pipeline."""
         # Fetch from all configured profiles
         all_symbols: dict[str, dict] = {}
+        fetch_success = False
 
         for profile in self.config.profiles:
-            movers = await self._client.fetch_movers(
-                profile=profile,
-                limit=self.config.max_symbols
-            )
-            for mover in movers:
-                symbol = mover.get("symbol")
-                if symbol and mover.get("ai_score", 0) >= self.config.min_score:
-                    if symbol not in all_symbols:
-                        all_symbols[symbol] = mover
+            try:
+                movers = await self._client.fetch_movers(
+                    profile=profile,
+                    limit=self.config.max_symbols
+                )
+                if movers:  # Got data from scanner
+                    fetch_success = True
+                    for mover in movers:
+                        symbol = mover.get("symbol")
+                        if symbol and mover.get("ai_score", 0) >= self.config.min_score:
+                            if symbol not in all_symbols:
+                                all_symbols[symbol] = mover
+            except Exception as e:
+                logger.warning(f"[SCANNER] Failed to fetch {profile}: {e}")
+
+        # Emit heartbeat on EVERY successful poll (not just discoveries)
+        # This keeps the scanner timestamp fresh
+        if fetch_success:
+            self._scanner_healthy = True
+            if self._on_heartbeat:
+                try:
+                    await self._on_heartbeat(len(all_symbols))
+                except Exception as e:
+                    logger.error(f"[SCANNER] Heartbeat callback failed: {e}")
+        else:
+            # No data from any profile - scanner may be down
+            self._scanner_healthy = False
+            logger.warning("[SCANNER] No data from any profile - scanner may be offline")
 
         new_symbols = set(all_symbols.keys())
 

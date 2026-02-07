@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from morpheus.execution.paper_position_manager import PaperPositionManager
+    from morpheus.core.market_mode import PhaseRegime
 
 from morpheus.risk.base import (
     AccountState,
@@ -44,14 +45,14 @@ class MASSRiskConfig:
     """MASS-specific risk limits."""
 
     max_risk_per_trade_pct: float = 0.02     # 2% per trade (paper mode compatible)
-    max_daily_loss_pct: float = 0.015        # 1.5% daily max
+    max_daily_loss_pct: float = 1.00         # 100% - effectively disabled for paper testing
     max_correlation_positions: int = 2        # Max positions in same sector/correlation
     symbol_cooldown_seconds: float = 60.0     # 60s cooldown per symbol (matches pipeline signal cooldown)
     max_concurrent_by_regime: dict[str, int] = field(
         default_factory=lambda: {
-            "HOT": 5,
-            "NORMAL": 3,
-            "CHOP": 2,
+            "HOT": 25,
+            "NORMAL": 25,
+            "CHOP": 25,  # Raised for paper testing (real TOS positions + paper positions)
             "DEAD": 0,
         }
     )
@@ -87,6 +88,9 @@ class MASSRiskGovernor(RiskOverlay):
         # Current MASS regime mode (set externally)
         self._current_regime_mode: str = "NORMAL"
 
+        # Phase regime (set externally; when set, overrides RTH regime limits)
+        self._phase_regime: PhaseRegime | None = None
+
     @property
     def name(self) -> str:
         return "mass_risk_governor"
@@ -100,8 +104,13 @@ class MASSRiskGovernor(RiskOverlay):
         return "MASS Risk Governor with enhanced per-trade and regime-based limits"
 
     def set_regime_mode(self, mode: str) -> None:
-        """Set the current MASS regime mode (called from pipeline)."""
+        """Set the current MASS regime mode (called from pipeline during RTH)."""
         self._current_regime_mode = mode
+        self._phase_regime = None  # Clear phase regime when RTH regime is set
+
+    def set_phase_regime(self, phase_regime: PhaseRegime) -> None:
+        """Set phase-specific regime (called from pipeline during PREMARKET/AFTER_HOURS)."""
+        self._phase_regime = phase_regime
 
     def evaluate(
         self,
@@ -167,16 +176,28 @@ class MASSRiskGovernor(RiskOverlay):
             veto_reasons.append(VetoReason.POSITION_ALREADY_OPEN)
             details.append(f"Already holding position in {symbol}")
 
-        # Check 4: Regime-based position count limit
-        regime_max = self._config.max_concurrent_by_regime.get(
-            self._current_regime_mode, 3
-        )
-        if account.open_position_count >= regime_max:
-            veto_reasons.append(VetoReason.REGIME_POSITION_LIMIT)
-            details.append(
-                f"Regime {self._current_regime_mode} limits to {regime_max} positions, "
-                f"currently {account.open_position_count}"
+        # Check 4: Position count limit (phase-aware)
+        # During PREMARKET/AFTER_HOURS, use phase regime limits (NOT RTH regime)
+        if self._phase_regime is not None:
+            # Phase regime: use phase-specific max_positions
+            phase_max = self._phase_regime.max_positions
+            if account.open_position_count >= phase_max:
+                veto_reasons.append(VetoReason.REGIME_POSITION_LIMIT)
+                details.append(
+                    f"Phase {self._phase_regime.phase.value} limits to {phase_max} positions, "
+                    f"currently {account.open_position_count}"
+                )
+        else:
+            # RTH: use computed MASS regime limits
+            regime_max = self._config.max_concurrent_by_regime.get(
+                self._current_regime_mode, 3
             )
+            if account.open_position_count >= regime_max:
+                veto_reasons.append(VetoReason.REGIME_POSITION_LIMIT)
+                details.append(
+                    f"Regime {self._current_regime_mode} limits to {regime_max} positions, "
+                    f"currently {account.open_position_count}"
+                )
 
         # If MASS vetoed, return immediately
         if veto_reasons:

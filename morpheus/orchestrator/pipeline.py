@@ -25,7 +25,11 @@ from decimal import Decimal
 from typing import Any, Callable, Awaitable
 
 from morpheus.core.events import Event, EventType, create_event
-from morpheus.core.market_mode import MarketMode, get_market_mode, get_time_et
+from morpheus.core.market_mode import (
+    MarketMode, MarketPhase, PhaseRegime,
+    get_market_mode, get_market_phase, get_phase_regime, get_time_et,
+    PREMARKET_NORMAL,
+)
 
 # Features & Regime
 from morpheus.features.feature_engine import FeatureEngine, FeatureContext
@@ -115,9 +119,12 @@ class PipelineConfig:
     # Minimum confidence to emit SIGNAL_CANDIDATE events
     min_signal_confidence: float = 0.0  # 0 = emit all signals
 
-    # Position sizing config
-    risk_per_trade_pct: float = 0.01  # 1%
+    # Position sizing config (IBKR_Algo_BOT_V2 parity)
+    risk_per_trade_pct: float = 0.02  # 2% - matches IBKR bot
     max_position_pct: float = 0.10  # 10%
+
+    # Paper trading equity (for position sizing parity with IBKR_Algo_BOT_V2)
+    paper_equity: float = 500.0  # $500 paper equity for comparable P&L
 
     # Kill switch respected even in permissive mode
     respect_kill_switch: bool = True
@@ -284,6 +291,8 @@ class SignalPipeline:
             config=SupervisorConfig(),
         )
         self._current_mass_regime: MASSRegime | None = None
+        self._current_phase_regime: PhaseRegime | None = None
+        self._last_phase: MarketPhase | None = None  # Track for phase transition events
 
         # Wrap risk manager with MASS governor if enabled
         if self._mass_config.enabled and self._mass_config.regime_mapping_enabled:
@@ -567,13 +576,45 @@ class SignalPipeline:
             )
             await self._emit(regime_event)
 
-            # Stage 2.3: MASS Regime Mapping (HOT/NORMAL/CHOP/DEAD)
+            # Stage 2.3: Phase-aware regime routing
+            # Premarket and after-hours use phase-specific regimes, NOT RTH regime
+            market_phase = get_market_phase()
+            phase_regime = get_phase_regime(market_phase)
+
+            # Emit phase transition event when phase changes
+            if self._last_phase is not None and self._last_phase != market_phase:
+                phase_event = create_event(
+                    EventType.MARKET_PHASE_CHANGE,
+                    payload={
+                        "phase": market_phase.value,
+                        "previous_phase": self._last_phase.value,
+                        "regime": phase_regime.rationale if phase_regime else "RTH_COMPUTED",
+                    },
+                )
+                await self._emit(phase_event)
+                logger.info(
+                    f"[PIPELINE] Phase transition: {self._last_phase.value} -> {market_phase.value}"
+                )
+            self._last_phase = market_phase
+
             if self._mass_config.enabled:
-                mass_regime = self._mass_regime_mapper.map(regime)
-                self._current_mass_regime = mass_regime
-                # Update MASS risk governor with current regime
-                if isinstance(self._risk_manager, MASSRiskGovernor):
-                    self._risk_manager.set_regime_mode(mass_regime.mode.value)
+                if phase_regime is not None:
+                    # NON-RTH: Use phase-specific regime, ignore computed RTH regime
+                    self._current_phase_regime = phase_regime
+                    # Tell risk governor we're in a phase regime (bypasses RTH limits)
+                    if isinstance(self._risk_manager, MASSRiskGovernor):
+                        self._risk_manager.set_phase_regime(phase_regime)
+                    logger.debug(
+                        f"[PIPELINE] {symbol} phase={market_phase.value} "
+                        f"regime={phase_regime.rationale}"
+                    )
+                else:
+                    # RTH: Use computed MASS regime as normal
+                    self._current_phase_regime = None
+                    mass_regime = self._mass_regime_mapper.map(regime)
+                    self._current_mass_regime = mass_regime
+                    if isinstance(self._risk_manager, MASSRiskGovernor):
+                        self._risk_manager.set_regime_mode(mass_regime.mode.value)
 
             # Stage 2.5: MASS Structure Analysis (if enabled)
             if self._structure_analyzer and self._mass_config.enabled:
@@ -632,6 +673,17 @@ class SignalPipeline:
 
             # Process each actionable signal
             for signal in signals:
+                # Emit phase-allowed event for visibility
+                if phase_regime is not None:
+                    await self._emit(create_event(
+                        EventType.STRATEGY_PHASE_ALLOWED,
+                        symbol=symbol,
+                        payload={
+                            "strategy": signal.strategy_name,
+                            "phase": market_phase.value,
+                            "regime": phase_regime.rationale,
+                        },
+                    ))
                 await self._process_signal(signal, feature_context, snapshot)
 
         except Exception as e:
@@ -810,26 +862,33 @@ class SignalPipeline:
 
         If a position manager is available, returns real position/exposure data.
         Otherwise falls back to conservative defaults.
+
+        Uses paper_equity from config ($500 default for IBKR parity).
         """
+        # Get paper equity from config (default $500 for IBKR_Algo_BOT_V2 parity)
+        paper_equity = Decimal(str(self.config.paper_equity))
+
         if self._position_manager:
             return self._position_manager.get_account_state(
+                base_equity=paper_equity,
                 kill_switch_active=self._state.kill_switch_active,
             )
 
         # Fallback stub for when no position manager is available
         return AccountState(
-            total_equity=Decimal("100000"),  # $100k default
-            cash_available=Decimal("50000"),
-            buying_power=Decimal("100000"),
+            total_equity=paper_equity,
+            cash_available=paper_equity,
+            buying_power=paper_equity,
             open_position_count=0,
             total_exposure=Decimal("0"),
             exposure_pct=0.0,
             daily_pnl=Decimal("0"),
             daily_pnl_pct=0.0,
-            peak_equity=Decimal("100000"),
+            peak_equity=paper_equity,
             current_drawdown_pct=0.0,
             kill_switch_active=self._state.kill_switch_active,
             manual_halt=False,
+            is_paper_mode=True,  # Deliverable 3 - Paper mode isolation
         )
 
     # =========================================================================
@@ -877,6 +936,9 @@ class SignalPipeline:
                 }
                 for symbol in self._state.active_symbols
             },
+            # Phase-aware regime status
+            "market_phase": get_market_phase().value,
+            "phase_regime": self._current_phase_regime.to_dict() if self._current_phase_regime else None,
             # MASS status
             "mass_enabled": self._mass_config.enabled,
             "mass_structure_analyzer": self._structure_analyzer is not None,

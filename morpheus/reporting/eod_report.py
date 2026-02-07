@@ -18,6 +18,8 @@ from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
+from morpheus.core.validation_mode import get_validation_summary, is_validation_mode
+
 logger = logging.getLogger(__name__)
 
 
@@ -78,6 +80,121 @@ class RejectionAnalysis:
 
 
 @dataclass
+class MicrostructureSegment:
+    """
+    EOD report segmentation by microstructure status.
+
+    Segments trades/signals by:
+    - SSR (Short Sale Restriction) status
+    - HTB (Hard To Borrow) status
+    - Halt-affected symbols
+    - Data-stale prevented entries
+    """
+
+    # SSR segment
+    ssr_symbols: list[str] = field(default_factory=list)
+    ssr_signals: int = 0
+    ssr_risk_approvals: int = 0
+    ssr_executions: int = 0
+    ssr_blocked: int = 0
+    ssr_pnl: float = 0.0
+
+    # HTB segment
+    htb_symbols: list[str] = field(default_factory=list)
+    htb_signals: int = 0
+    htb_risk_approvals: int = 0
+    htb_executions: int = 0
+    htb_blocked: int = 0
+    htb_pnl: float = 0.0
+
+    # Halt segment
+    halt_affected_symbols: list[str] = field(default_factory=list)
+    halt_blocked_entries: int = 0
+    post_halt_trades: int = 0
+
+    # Data staleness
+    data_stale_prevented: int = 0
+    data_stale_symbols: list[str] = field(default_factory=list)
+
+    # Timing metrics by regime
+    avg_hold_time_ssr: float = 0.0
+    avg_hold_time_htb: float = 0.0
+    avg_hold_time_normal: float = 0.0
+
+    # Slippage by regime
+    avg_slippage_ssr: float = 0.0
+    avg_slippage_htb: float = 0.0
+    avg_slippage_normal: float = 0.0
+
+    # Win rate by regime
+    win_rate_ssr: float = 0.0
+    win_rate_htb: float = 0.0
+    win_rate_normal: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ssr": {
+                "symbols": self.ssr_symbols[:10],
+                "signals": self.ssr_signals,
+                "risk_approvals": self.ssr_risk_approvals,
+                "executions": self.ssr_executions,
+                "blocked": self.ssr_blocked,
+                "pnl": self.ssr_pnl,
+                "avg_hold_time": self.avg_hold_time_ssr,
+                "avg_slippage": self.avg_slippage_ssr,
+                "win_rate": self.win_rate_ssr,
+            },
+            "htb": {
+                "symbols": self.htb_symbols[:10],
+                "signals": self.htb_signals,
+                "risk_approvals": self.htb_risk_approvals,
+                "executions": self.htb_executions,
+                "blocked": self.htb_blocked,
+                "pnl": self.htb_pnl,
+                "avg_hold_time": self.avg_hold_time_htb,
+                "avg_slippage": self.avg_slippage_htb,
+                "win_rate": self.win_rate_htb,
+            },
+            "halt_affected": {
+                "symbols": self.halt_affected_symbols[:10],
+                "blocked_entries": self.halt_blocked_entries,
+                "post_halt_trades": self.post_halt_trades,
+            },
+            "data_stale": {
+                "prevented": self.data_stale_prevented,
+                "symbols": self.data_stale_symbols[:10],
+            },
+        }
+
+    def to_markdown(self) -> str:
+        """Generate markdown section for microstructure."""
+        lines = [
+            "## Microstructure Status Segments",
+            "",
+            "### SSR (Short Sale Restriction)",
+            f"- Symbols: {len(self.ssr_symbols)} ({', '.join(self.ssr_symbols[:5])}{'...' if len(self.ssr_symbols) > 5 else ''})",
+            f"- Signals: {self.ssr_signals} | Blocked: {self.ssr_blocked}",
+            f"- P&L: ${self.ssr_pnl:+.2f} | Win Rate: {self.win_rate_ssr:.1f}%",
+            "",
+            "### HTB (Hard To Borrow)",
+            f"- Symbols: {len(self.htb_symbols)} ({', '.join(self.htb_symbols[:5])}{'...' if len(self.htb_symbols) > 5 else ''})",
+            f"- Signals: {self.htb_signals} | Blocked: {self.htb_blocked}",
+            f"- P&L: ${self.htb_pnl:+.2f} | Win Rate: {self.win_rate_htb:.1f}%",
+            "",
+            "### Halt-Affected",
+            f"- Symbols: {len(self.halt_affected_symbols)}",
+            f"- Blocked Entries: {self.halt_blocked_entries}",
+            f"- Post-Halt Trades: {self.post_halt_trades}",
+            "",
+            "### Data Staleness Prevention",
+            f"- Entries Prevented: {self.data_stale_prevented}",
+            f"- Symbols: {', '.join(self.data_stale_symbols[:5])}{'...' if len(self.data_stale_symbols) > 5 else ''}",
+            "",
+        ]
+        return "\n".join(lines)
+
+
+@dataclass
 class EODReport:
     """End-of-day report."""
 
@@ -117,6 +234,18 @@ class EODReport:
     market_regime_summary: str
     active_symbols: list[str]
 
+    # Phase / Regime summary
+    phase_regime_summary: dict[str, Any] | None = None
+
+    # Microstructure segmentation (optional)
+    microstructure_segment: MicrostructureSegment | None = None
+
+    # Validation mode summary (optional)
+    validation_summary: dict[str, Any] | None = None
+
+    # Exit profile effectiveness (strategy x exit_reason breakdown)
+    exit_profile_effectiveness: dict[str, Any] | None = None
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -152,6 +281,9 @@ class EODReport:
                 "regime_summary": self.market_regime_summary,
                 "active_symbols": self.active_symbols,
             },
+            "phase_regime": self.phase_regime_summary,
+            "microstructure": self.microstructure_segment.to_dict() if self.microstructure_segment else None,
+            "validation": self.validation_summary,
         }
 
     def to_markdown(self) -> str:
@@ -221,6 +353,43 @@ class EODReport:
                     f"{t.pnl_percent:+.1f}% | {hold_min}m | {t.exit_reason} |"
                 )
             lines.append("")
+
+        # Add phase/regime summary if available
+        if self.phase_regime_summary:
+            prs = self.phase_regime_summary
+            lines.extend([
+                "## Phase / Regime Summary",
+                "",
+                f"- **Premarket regime**: {prs.get('premarket_regime', 'N/A')}",
+                f"- **Premarket signals**: {prs.get('premarket_signals', 0)}",
+                f"- **Premarket regime_position_limit vetoes**: {prs.get('premarket_regime_vetoes', 0)}",
+                f"- **RTH regimes observed**: {prs.get('rth_regimes', 'N/A')}",
+                f"- **RTH signals**: {prs.get('rth_signals', 0)}",
+                f"- **RTH regime_position_limit vetoes**: {prs.get('rth_regime_vetoes', 0)}",
+                "",
+            ])
+
+        # Add exit profile effectiveness if available
+        if self.exit_profile_effectiveness:
+            lines.extend([
+                "## Exit Profile Effectiveness",
+                "",
+                "| Strategy | Exit Type | Count | Avg Hold(s) | Avg P&L |",
+                "|----------|-----------|-------|-------------|---------|",
+            ])
+            for strat, reasons in sorted(self.exit_profile_effectiveness.items()):
+                if isinstance(reasons, dict):
+                    for reason, stats in sorted(reasons.items()):
+                        if isinstance(stats, dict):
+                            lines.append(
+                                f"| {strat} | {reason} | {stats.get('count', 0)} | "
+                                f"{stats.get('avg_hold', 0):.0f} | ${stats.get('avg_pnl', 0):+.2f} |"
+                            )
+            lines.append("")
+
+        # Add microstructure segmentation if available
+        if self.microstructure_segment:
+            lines.append(self.microstructure_segment.to_markdown())
 
         return "\n".join(lines)
 
@@ -343,6 +512,12 @@ class EODReportGenerator:
         regime_summary = self._summarize_regimes(regime_values)
         active_symbols = list(set(s.get('symbol', '') for s in signals))
 
+        # Validation summary (if validation mode is active)
+        validation_data = None
+        if is_validation_mode():
+            validation_data = get_validation_summary()
+            logger.info(f"[EOD] Validation summary: {validation_data.get('validation_status', 'N/A')}")
+
         return EODReport(
             report_date=report_date,
             generated_at=datetime.now(timezone.utc),
@@ -368,6 +543,7 @@ class EODReportGenerator:
             top_issues=top_issues,
             market_regime_summary=regime_summary,
             active_symbols=active_symbols,
+            validation_summary=validation_data,
         )
 
     def _calculate_max_drawdown(self, pnls: list[float]) -> float:

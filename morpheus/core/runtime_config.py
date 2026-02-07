@@ -77,15 +77,39 @@ class RuntimeConfig:
     # Per-strategy max hold overrides (seconds)
     strategy_max_hold: dict[str, float] = field(default_factory=lambda: {
         "order_flow_scalp": 120,       # 2 min for scalps
-        "premarket_breakout": 300,     # 5 min
-        "catalyst_momentum": 300,
+        "premarket_breakout": 1800,    # 30 min - let premarket runners run
+        "catalyst_momentum": 600,      # 10 min (was 300) - more time to express
         "short_squeeze": 300,
         "coil_breakout": 300,
         "gap_fade": 300,
         "day2_continuation": 600,      # 10 min for continuation
-        "first_pullback": 300,
+        "first_pullback": 900,         # 15 min (was 300) - pullbacks need time
         "hod_continuation": 300,
         "vwap_reclaim": 180,
+    })
+
+    # Per-strategy trail activation overrides (pct move to arm trailing)
+    strategy_trail_activation: dict[str, float] = field(default_factory=lambda: {
+        "catalyst_momentum": 0.005,    # 0.5% (was global 1%)
+        "first_pullback": 0.004,       # 0.4%
+        "premarket_breakout": 0.008,   # 0.8%
+        "order_flow_scalp": 0.003,     # 0.3%
+        "day2_continuation": 0.006,    # 0.6%
+        "coil_breakout": 0.005,        # 0.5%
+        "short_squeeze": 0.007,        # 0.7%
+        "gap_fade": 0.005,             # 0.5%
+        "hod_continuation": 0.005,     # 0.5%
+        "vwap_reclaim": 0.004,         # 0.4%
+    })
+
+    # Per-strategy partial profit-take config
+    # enabled: whether partial take is active for this strategy
+    # take_pct: fraction of shares to sell (0.50 = 50%)
+    # trigger_pct: favorable move to trigger partial (0.005 = +0.5%)
+    strategy_partial_take: dict[str, dict] = field(default_factory=lambda: {
+        "catalyst_momentum": {"enabled": True, "take_pct": 0.50, "trigger_pct": 0.005},
+        "first_pullback":    {"enabled": True, "take_pct": 0.50, "trigger_pct": 0.005},
+        "short_squeeze":     {"enabled": True, "take_pct": 0.50, "trigger_pct": 0.007},
     })
 
     # Last update timestamp

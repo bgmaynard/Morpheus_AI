@@ -395,6 +395,198 @@ class StrictExecutionGuard(ExecutionGuard):
         return self._standard.check(risk_result, snapshot, strict_config)
 
 
+@dataclass(frozen=True)
+class QuoteFreshnessConfig:
+    """
+    Configuration for quote freshness validation.
+
+    CRITICAL SAFETY: Prevents orders on stale/invalid quotes that caused
+    ~$35,000 in losses on 2026-02-03 from bad warmup data.
+
+    Thresholds calibrated for small-cap momentum trading.
+    """
+
+    # Maximum age of quote timestamp (milliseconds)
+    # 2000ms = 2 seconds - quotes older than this are stale
+    max_quote_age_ms: int = 2000
+
+    # Maximum allowed spread (percentage)
+    # 3% is wide but still tradeable for small caps
+    max_spread_pct: float = 3.0
+
+    # Minimum required prices
+    min_bid: float = 0.01  # Bid must be at least $0.01
+    min_ask: float = 0.01  # Ask must be at least $0.01
+    min_last: float = 0.01  # Last must be at least $0.01
+
+    # Price sanity bounds (relative to last price)
+    # Rejects if bid/ask are more than 50% away from last
+    max_price_deviation_pct: float = 50.0
+
+    # Volume sanity (minimum volume to ensure quote is real)
+    min_volume_for_freshness: int = 100
+
+
+class QuoteFreshnessGuard(ExecutionGuard):
+    """
+    Quote Freshness Guard - Critical pre-order validation.
+
+    CRITICAL SAFETY FEATURE added after 2026-02-03 losses caused by
+    stale/cached quotes from server warmup entering positions at
+    wrong prices (resulting in instant -35% to -65% hard stops).
+
+    Checks (in priority order):
+    1. Quote timestamp freshness (not stale)
+    2. Bid/ask validity (exist and > 0)
+    3. Last price validity
+    4. Price sanity (bid/ask near last, not wildly divergent)
+    5. Spread sanity (not absurdly wide)
+    6. Minimum volume (quote represents real activity)
+
+    This guard should be the FIRST check in the execution chain.
+    If quotes are bad, nothing else matters.
+
+    All checks are PURE and DETERMINISTIC.
+    """
+
+    def __init__(self, config: QuoteFreshnessConfig | None = None):
+        """
+        Initialize the quote freshness guard.
+
+        Args:
+            config: Optional custom configuration
+        """
+        self._config = config or QuoteFreshnessConfig()
+
+    @property
+    def name(self) -> str:
+        return "quote_freshness_guard"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def description(self) -> str:
+        return "Critical pre-order validation for quote freshness and validity"
+
+    def check(
+        self,
+        risk_result: RiskResult,
+        snapshot: MarketSnapshot,
+        config: ExecutionConfig,
+    ) -> ExecutionCheck:
+        """
+        Check if quote data is fresh and valid for order submission.
+
+        PURE FUNCTION: depends only on inputs, no side effects.
+
+        This is the FIRST LINE OF DEFENSE against bad fill prices.
+        """
+        cfg = self._config
+        reasons: list[BlockReason] = []
+        details_parts: list[str] = []
+
+        # Check 1: Quote timestamp freshness
+        now = datetime.now(timezone.utc)
+        quote_age_ms = int((now - snapshot.timestamp).total_seconds() * 1000)
+
+        if quote_age_ms > cfg.max_quote_age_ms:
+            reasons.append(BlockReason.QUOTE_STALE)
+            details_parts.append(
+                f"Quote stale: {quote_age_ms}ms old > {cfg.max_quote_age_ms}ms max"
+            )
+
+        # Check 2: Bid validity
+        if snapshot.bid < cfg.min_bid:
+            reasons.append(BlockReason.QUOTE_INVALID)
+            details_parts.append(
+                f"Invalid bid: ${snapshot.bid:.4f} < ${cfg.min_bid:.2f} minimum"
+            )
+
+        # Check 3: Ask validity
+        if snapshot.ask < cfg.min_ask:
+            reasons.append(BlockReason.QUOTE_INVALID)
+            details_parts.append(
+                f"Invalid ask: ${snapshot.ask:.4f} < ${cfg.min_ask:.2f} minimum"
+            )
+
+        # Check 4: Last price validity
+        if snapshot.last < cfg.min_last:
+            reasons.append(BlockReason.QUOTE_INVALID)
+            details_parts.append(
+                f"Invalid last: ${snapshot.last:.4f} < ${cfg.min_last:.2f} minimum"
+            )
+
+        # Check 5: Bid/ask sanity vs last price (catch stale cached data)
+        # This is the KEY check that would have caught the 2026-02-03 losses
+        if snapshot.last > 0 and snapshot.bid > 0:
+            bid_deviation_pct = abs(snapshot.bid - snapshot.last) / snapshot.last * 100
+            if bid_deviation_pct > cfg.max_price_deviation_pct:
+                reasons.append(BlockReason.QUOTE_SANITY_FAILED)
+                details_parts.append(
+                    f"Bid sanity fail: ${snapshot.bid:.2f} is {bid_deviation_pct:.1f}% "
+                    f"from last ${snapshot.last:.2f} (max {cfg.max_price_deviation_pct}%)"
+                )
+
+        if snapshot.last > 0 and snapshot.ask > 0:
+            ask_deviation_pct = abs(snapshot.ask - snapshot.last) / snapshot.last * 100
+            if ask_deviation_pct > cfg.max_price_deviation_pct:
+                reasons.append(BlockReason.QUOTE_SANITY_FAILED)
+                details_parts.append(
+                    f"Ask sanity fail: ${snapshot.ask:.2f} is {ask_deviation_pct:.1f}% "
+                    f"from last ${snapshot.last:.2f} (max {cfg.max_price_deviation_pct}%)"
+                )
+
+        # Check 6: Spread sanity
+        spread_pct = snapshot.spread_pct
+        if spread_pct > cfg.max_spread_pct:
+            reasons.append(BlockReason.SPREAD_TOO_WIDE)
+            details_parts.append(
+                f"Spread too wide: {spread_pct:.2f}% > {cfg.max_spread_pct}% max"
+            )
+
+        # Check 7: Volume sanity (ensure quote represents real activity)
+        if snapshot.volume < cfg.min_volume_for_freshness:
+            reasons.append(BlockReason.LOW_LIQUIDITY)
+            details_parts.append(
+                f"Low volume: {snapshot.volume:,} < {cfg.min_volume_for_freshness:,} min"
+            )
+
+        # Make decision
+        if reasons:
+            # Deduplicate reasons
+            unique_reasons = tuple(dict.fromkeys(reasons))
+            return self.create_blocked(
+                reasons=unique_reasons,
+                spread_pct=spread_pct,
+                spread_threshold=cfg.max_spread_pct,
+                slippage_pct=0.0,
+                slippage_threshold=0.0,
+                volume=snapshot.volume,
+                min_volume=cfg.min_volume_for_freshness,
+                details="; ".join(details_parts),
+            )
+        else:
+            return self.create_executable(
+                spread_pct=spread_pct,
+                spread_threshold=cfg.max_spread_pct,
+                slippage_pct=0.0,
+                slippage_threshold=0.0,
+                volume=snapshot.volume,
+                min_volume=cfg.min_volume_for_freshness,
+                details=f"Quote fresh: {quote_age_ms}ms old, bid ${snapshot.bid:.2f}, "
+                        f"ask ${snapshot.ask:.2f}, spread {spread_pct:.2f}%",
+            )
+
+
+def create_quote_freshness_guard(
+    config: QuoteFreshnessConfig | None = None,
+) -> QuoteFreshnessGuard:
+    """Factory function to create a QuoteFreshnessGuard."""
+    return QuoteFreshnessGuard(config)
+
+
 def create_standard_guard(config: GuardConfig | None = None) -> StandardExecutionGuard:
     """Factory function to create a StandardExecutionGuard."""
     return StandardExecutionGuard(config)

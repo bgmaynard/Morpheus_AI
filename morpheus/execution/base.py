@@ -76,6 +76,11 @@ class BlockReason(Enum):
     # Time authority
     TIME_DRIFT_UNSAFE = "time_drift_unsafe"
 
+    # Quote freshness (Deliverable 1 - Critical Safety)
+    QUOTE_STALE = "quote_stale"  # Quote timestamp too old
+    QUOTE_INVALID = "quote_invalid"  # Missing/invalid bid/ask/last
+    QUOTE_SANITY_FAILED = "quote_sanity_failed"  # Price outside reasonable bounds
+
 
 class OrderType(Enum):
     """Order types supported."""

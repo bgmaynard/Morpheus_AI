@@ -29,6 +29,27 @@ from morpheus.core.time_authority import (
     drift_ms,
     is_drift_safe,
 )
+from morpheus.core.symbol_state import (
+    SecurityStatus,
+    BorrowStatus,
+    BorrowSource,
+    SymbolState,
+    MicrostructureConfig,
+    SymbolStateManager,
+)
+from morpheus.core.validation_mode import (
+    ValidationStatus,
+    ValidationModeConfig,
+    ValidationCounters,
+    ValidationLogger,
+    init_validation_mode,
+    get_validation_config,
+    get_validation_counters,
+    get_validation_logger,
+    is_validation_mode,
+    reset_validation_counters,
+    get_validation_summary,
+)
 
 __all__ = [
     "Event",
@@ -63,4 +84,23 @@ __all__ = [
     "source",
     "drift_ms",
     "is_drift_safe",
+    # Symbol state (microstructure)
+    "SecurityStatus",
+    "BorrowStatus",
+    "BorrowSource",
+    "SymbolState",
+    "MicrostructureConfig",
+    "SymbolStateManager",
+    # Validation mode
+    "ValidationStatus",
+    "ValidationModeConfig",
+    "ValidationCounters",
+    "ValidationLogger",
+    "init_validation_mode",
+    "get_validation_config",
+    "get_validation_counters",
+    "get_validation_logger",
+    "is_validation_mode",
+    "reset_validation_counters",
+    "get_validation_summary",
 ]

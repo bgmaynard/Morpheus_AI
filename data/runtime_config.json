@@ -21,15 +21,32 @@
   "trail_distance_pct": 0.015,
   "strategy_max_hold": {
     "order_flow_scalp": 120,
-    "premarket_breakout": 300,
-    "catalyst_momentum": 300,
+    "premarket_breakout": 1800,
+    "catalyst_momentum": 600,
     "short_squeeze": 300,
     "coil_breakout": 300,
     "gap_fade": 300,
     "day2_continuation": 600,
-    "first_pullback": 300,
+    "first_pullback": 900,
     "hod_continuation": 300,
     "vwap_reclaim": 180
   },
-  "last_reload": "2026-02-04T21:00:00+00:00"
+  "strategy_trail_activation": {
+    "catalyst_momentum": 0.005,
+    "first_pullback": 0.004,
+    "premarket_breakout": 0.008,
+    "order_flow_scalp": 0.003,
+    "day2_continuation": 0.006,
+    "coil_breakout": 0.005,
+    "short_squeeze": 0.007,
+    "gap_fade": 0.005,
+    "hod_continuation": 0.005,
+    "vwap_reclaim": 0.004
+  },
+  "strategy_partial_take": {
+    "catalyst_momentum": {"enabled": true, "take_pct": 0.50, "trigger_pct": 0.005},
+    "first_pullback": {"enabled": true, "take_pct": 0.50, "trigger_pct": 0.005},
+    "short_squeeze": {"enabled": true, "take_pct": 0.50, "trigger_pct": 0.007}
+  },
+  "last_reload": ""
 }

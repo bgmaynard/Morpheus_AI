@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -52,6 +53,10 @@ from typing import Any, Callable, Awaitable
 
 from morpheus.core.events import Event, EventType, create_event
 from morpheus.risk.base import AccountState
+from morpheus.core.validation_mode import (
+    is_validation_mode,
+    get_validation_logger,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +69,18 @@ class ExitReason(str, Enum):
     TRAIL_STOP = "TRAIL_STOP"    # Profit protection
     KILL_SWITCH = "KILL_SWITCH"  # Emergency exit
     MANUAL = "MANUAL"            # Human intervention
+
+    # Microstructure exit reasons
+    SSR_MOMENTUM_DECAY = "SSR_MOMENTUM_DECAY"        # SSR velocity/ROC decay
+    SSR_BID_COLLAPSE = "SSR_BID_COLLAPSE"            # SSR bid depth collapse
+    SSR_UPTICK_EXHAUSTION = "SSR_UPTICK_EXHAUSTION"  # Consecutive uptick rejections
+    SSR_SPREAD_BLOWOUT = "SSR_SPREAD_BLOWOUT"        # SSR spread widening
+    SSR_JACKKNIFE = "SSR_JACKKNIFE"                  # SSR jackknife pattern
+    SSR_TIME_FAILSAFE = "SSR_TIME_FAILSAFE"          # SSR no new high timeout
+    HTB_PROFIT_PROTECT = "HTB_PROFIT_PROTECT"        # HTB fast profit taking
+    HALT_EXIT = "HALT_EXIT"                          # Halted during position
+    POST_HALT_FAILURE = "POST_HALT_FAILURE"          # Post-halt instability
+    LIQUIDITY_EVAPORATION = "LIQUIDITY_EVAPORATION"  # General liquidity vanish
 
 
 @dataclass
@@ -90,6 +107,11 @@ class ExitPlan:
     direction: str = "long"
     computed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
+    # Partial profit-taking (optional, strategy-dependent)
+    allow_partial_take: bool = False
+    partial_take_pct: float = 0.50       # fraction of shares to sell (0.50 = 50%)
+    partial_trigger_pct: float = 0.005   # favorable move to trigger partial (+0.5%)
+
     def is_valid(self) -> tuple[bool, str]:
         """Validate exit plan has all required components."""
         if self.max_hold_seconds <= 0:
@@ -98,6 +120,11 @@ class ExitPlan:
             return False, "hard_stop_price must be > 0"
         if self.trail_distance_pct <= 0:
             return False, "trail_distance_pct must be > 0"
+        if self.allow_partial_take:
+            if not (0.0 < self.partial_take_pct < 1.0):
+                return False, "partial_take_pct must be between 0 and 1"
+            if self.partial_trigger_pct <= 0:
+                return False, "partial_trigger_pct must be > 0"
         return True, ""
 
 
@@ -122,15 +149,36 @@ class ExitConfig:
     # Per-strategy max hold overrides
     strategy_max_hold: dict[str, float] = field(default_factory=lambda: {
         "order_flow_scalp": 120,       # 2 min for scalps
-        "premarket_breakout": 300,     # 5 min
-        "catalyst_momentum": 300,
+        "premarket_breakout": 1800,    # 30 min - let premarket runners run
+        "catalyst_momentum": 600,      # 10 min (was 300) - more time to express
         "short_squeeze": 300,
         "coil_breakout": 300,
         "gap_fade": 300,
         "day2_continuation": 600,      # 10 min for continuation
-        "first_pullback": 300,
+        "first_pullback": 900,         # 15 min (was 300) - pullbacks need time
         "hod_continuation": 300,
         "vwap_reclaim": 180,
+    })
+
+    # Per-strategy trail activation overrides (pct move to arm trailing)
+    strategy_trail_activation: dict[str, float] = field(default_factory=lambda: {
+        "catalyst_momentum": 0.005,    # 0.5% (was global 1%)
+        "first_pullback": 0.004,       # 0.4%
+        "premarket_breakout": 0.008,   # 0.8%
+        "order_flow_scalp": 0.003,     # 0.3%
+        "day2_continuation": 0.006,    # 0.6%
+        "coil_breakout": 0.005,        # 0.5%
+        "short_squeeze": 0.007,        # 0.7%
+        "gap_fade": 0.005,             # 0.5%
+        "hod_continuation": 0.005,     # 0.5%
+        "vwap_reclaim": 0.004,         # 0.4%
+    })
+
+    # Per-strategy partial profit-take config
+    strategy_partial_take: dict[str, dict] = field(default_factory=lambda: {
+        "catalyst_momentum": {"enabled": True, "take_pct": 0.50, "trigger_pct": 0.005},
+        "first_pullback":    {"enabled": True, "take_pct": 0.50, "trigger_pct": 0.005},
+        "short_squeeze":     {"enabled": True, "take_pct": 0.50, "trigger_pct": 0.007},
     })
 
 
@@ -177,10 +225,27 @@ class PaperPosition:
     client_order_id: str = ""
     correlation_id: str = ""
 
+    # ── Partial Profit-Taking ──────────────────────────────────────────
+    allow_partial_take: bool = False     # Strategy enables partial take?
+    partial_taken: bool = False          # Has partial been executed?
+    partial_take_pct: float = 0.50       # Fraction of shares to sell
+    partial_trigger_pct: float = 0.005   # Favorable move to trigger
+    original_shares: int = 0             # Shares at entry (before partial)
+    partial_take_pnl: float = 0.0        # Realized P&L from partial sell
+
+    # ── Microstructure State ─────────────────────────────────────────────
+    ssr_active_at_entry: bool = False    # Was SSR active when we entered?
+    htb_at_entry: bool = False           # Was HTB when we entered?
+    disable_trailing: bool = False       # SSR/microstructure override
+    last_new_high_ts: float = 0.0        # For SSR time-based failsafe
+    consecutive_rejections: int = 0      # For SSR uptick exhaustion
+
     def __post_init__(self):
         from datetime import timedelta
         if self.high_watermark == 0.0:
             self.high_watermark = self.entry_price
+        if self.original_shares == 0:
+            self.original_shares = self.shares
         # Calculate max exit timestamp
         self.max_exit_ts = self.entry_time + timedelta(seconds=self.max_hold_seconds)
 
@@ -229,6 +294,17 @@ class PaperPositionManager:
             "TRAIL_STOP": 0,
             "KILL_SWITCH": 0,
             "MANUAL": 0,
+            # Microstructure exits
+            "SSR_MOMENTUM_DECAY": 0,
+            "SSR_BID_COLLAPSE": 0,
+            "SSR_UPTICK_EXHAUSTION": 0,
+            "SSR_SPREAD_BLOWOUT": 0,
+            "SSR_JACKKNIFE": 0,
+            "SSR_TIME_FAILSAFE": 0,
+            "HTB_PROFIT_PROTECT": 0,
+            "HALT_EXIT": 0,
+            "POST_HALT_FAILURE": 0,
+            "LIQUIDITY_EVAPORATION": 0,
         }
 
         # Current regime mode (informational only, not used for exits in v1)
@@ -252,6 +328,8 @@ class PaperPositionManager:
                     trail_activation_pct=rc.trail_activation_pct,
                     trail_distance_pct=rc.trail_distance_pct,
                     strategy_max_hold=rc.strategy_max_hold,
+                    strategy_trail_activation=getattr(rc, 'strategy_trail_activation', {}),
+                    strategy_partial_take=getattr(rc, 'strategy_partial_take', {}),
                 )
             except Exception:
                 pass
@@ -314,8 +392,11 @@ class PaperPositionManager:
             )
             return None
 
-        # Layer 3: Trailing stop parameters
-        trail_activation = config.trail_activation_pct
+        # Layer 3: Trailing stop parameters (strategy-aware)
+        strategy_key = strategy_name.lower().replace(" ", "_")
+        trail_activation = config.strategy_trail_activation.get(
+            strategy_key, config.trail_activation_pct
+        )
         trail_distance = config.trail_distance_pct
 
         if trail_activation <= 0 or trail_distance <= 0:
@@ -325,6 +406,12 @@ class PaperPositionManager:
             )
             return None
 
+        # Partial profit-take config (strategy-specific)
+        partial_cfg = config.strategy_partial_take.get(strategy_key, {})
+        allow_partial = partial_cfg.get("enabled", False)
+        partial_take_pct = partial_cfg.get("take_pct", 0.50)
+        partial_trigger_pct = partial_cfg.get("trigger_pct", 0.005)
+
         # Create exit plan
         plan = ExitPlan(
             max_hold_seconds=max_hold,
@@ -333,6 +420,9 @@ class PaperPositionManager:
             trail_distance_pct=trail_distance,
             strategy_name=strategy_name,
             direction=direction,
+            allow_partial_take=allow_partial,
+            partial_take_pct=partial_take_pct,
+            partial_trigger_pct=partial_trigger_pct,
         )
 
         # Final validation
@@ -341,10 +431,11 @@ class PaperPositionManager:
             logger.warning(f"[EXIT_MGR] {symbol}: Exit plan invalid - {reason}")
             return None
 
+        partial_str = f" partial={partial_take_pct:.0%}@{partial_trigger_pct:.1%}" if allow_partial else ""
         logger.info(
             f"[EXIT_MGR] {symbol}: Exit plan valid - "
             f"max_hold={max_hold:.0f}s stop=${hard_stop_price:.4f} "
-            f"trail_act={trail_activation:.1%} trail_dist={trail_distance:.1%}"
+            f"trail_act={trail_activation:.1%} trail_dist={trail_distance:.1%}{partial_str}"
         )
 
         return plan
@@ -416,6 +507,16 @@ class PaperPositionManager:
         trail_activation_pct = meta.get("trail_activation_pct", 0.01)
         trail_distance_pct = meta.get("trail_distance_pct", 0.015)
 
+        # Partial profit-take flags from exit plan
+        allow_partial_take = meta.get("allow_partial_take", False)
+        partial_take_pct = meta.get("partial_take_pct", 0.50)
+        partial_trigger_pct = meta.get("partial_trigger_pct", 0.005)
+
+        # Microstructure flags from gate checks
+        ssr_active_at_entry = meta.get("ssr_active_at_entry", False)
+        htb_at_entry = meta.get("htb_at_entry", False)
+        disable_trailing = meta.get("disable_trailing", False)
+
         position = PaperPosition(
             position_id=str(uuid.uuid4()),
             symbol=symbol,
@@ -430,21 +531,44 @@ class PaperPositionManager:
             trail_distance_pct=trail_distance_pct,
             trailing_active=False,
             high_watermark=fill_price,
+            # Partial profit-take
+            allow_partial_take=allow_partial_take,
+            partial_take_pct=partial_take_pct,
+            partial_trigger_pct=partial_trigger_pct,
+            original_shares=shares,
+            # Metadata
             regime_at_entry=regime,
             structure_grade=structure_grade,
             client_order_id=client_order_id,
             correlation_id=correlation_id,
             last_price=fill_price,
+            # Microstructure flags
+            ssr_active_at_entry=ssr_active_at_entry,
+            htb_at_entry=htb_at_entry,
+            disable_trailing=disable_trailing,
+            last_new_high_ts=time.time() if not disable_trailing else 0.0,
         )
 
         self._positions[symbol] = position
 
+        # Build microstructure flags string
+        micro_flags = []
+        if ssr_active_at_entry:
+            micro_flags.append("SSR")
+        if htb_at_entry:
+            micro_flags.append("HTB")
+        if disable_trailing:
+            micro_flags.append("NO_TRAIL")
+        micro_str = f" | flags=[{','.join(micro_flags)}]" if micro_flags else ""
+
+        partial_str = f" | PARTIAL={partial_take_pct:.0%}@{partial_trigger_pct:.1%}" if allow_partial_take else ""
         logger.info(
             f"[EXIT_MGR] TRADE OPENED: {symbol} {direction.upper()} "
             f"{shares} shares @ ${fill_price:.4f} | "
             f"HARD_STOP=${hard_stop_price:.4f} | "
             f"max_hold={max_hold_seconds:.0f}s | "
-            f"trail_act={trail_activation_pct:.1%} trail_dist={trail_distance_pct:.1%} | "
+            f"trail_act={trail_activation_pct:.1%} trail_dist={trail_distance_pct:.1%}"
+            f"{partial_str}{micro_str} | "
             f"strategy={strategy_name}"
         )
 
@@ -465,6 +589,15 @@ class PaperPositionManager:
                     "max_exit_ts": position.max_exit_ts.isoformat(),
                     "trail_activation_pct": trail_activation_pct,
                     "trail_distance_pct": trail_distance_pct,
+                    "allow_partial_take": allow_partial_take,
+                    "partial_take_pct": partial_take_pct,
+                    "partial_trigger_pct": partial_trigger_pct,
+                },
+                # Microstructure status at entry
+                "microstructure": {
+                    "ssr_active": ssr_active_at_entry,
+                    "htb": htb_at_entry,
+                    "trailing_disabled": disable_trailing,
                 },
             },
             symbol=symbol,
@@ -540,6 +673,19 @@ class PaperPositionManager:
             await self._execute_exit(position, price, ExitReason.HARD_STOP)
             return
 
+        # 2.5. PARTIAL PROFIT TAKE (size reduction, NOT a full exit)
+        if (position.allow_partial_take
+                and not position.partial_taken
+                and not position.trailing_active
+                and not position.disable_trailing
+                and position.shares > 1):
+            pct_move = (price - position.entry_price) / position.entry_price
+            if position.direction == "short":
+                pct_move = -pct_move
+            if pct_move >= position.partial_trigger_pct:
+                await self._execute_partial_take(position, price)
+                # Do NOT return - continue to check trailing/time stops
+
         # 3. TRAILING STOP (profit protection - only after activation)
         if position.trailing_active:
             if position.direction == "long":
@@ -576,6 +722,92 @@ class PaperPositionManager:
             await self._execute_exit(position, price, ExitReason.TIME_STOP)
             return
 
+    # ─── Partial Profit-Taking ─────────────────────────────────────────
+
+    async def _execute_partial_take(self, position: PaperPosition, current_price: float) -> None:
+        """
+        Execute partial profit-taking: sell a fraction, arm trailing on remainder.
+
+        This is NOT a full exit - the position stays open with reduced shares.
+        """
+        shares_to_sell = max(1, int(position.shares * position.partial_take_pct))
+        # Always keep at least 1 share for trailing
+        if shares_to_sell >= position.shares:
+            shares_to_sell = position.shares - 1
+        if shares_to_sell < 1:
+            return  # Can't split - skip partial
+
+        symbol = position.symbol
+
+        # Compute partial P&L
+        if position.direction == "long":
+            partial_pnl = (current_price - position.entry_price) * shares_to_sell
+        else:
+            partial_pnl = (position.entry_price - current_price) * shares_to_sell
+
+        # Update position state
+        position.partial_taken = True
+        position.partial_take_pnl = partial_pnl
+        remaining = position.shares - shares_to_sell
+        position.shares = remaining
+
+        # Activate trailing on remainder
+        position.trailing_active = True
+        position.high_watermark = current_price
+
+        # Update daily P&L for the realized partial
+        self._daily_realized_pnl += partial_pnl
+
+        side = "sell" if position.direction == "long" else "buy"
+        client_order_id = f"partial_{uuid.uuid4().hex[:8]}"
+        correlation_id = f"partial_{position.position_id[:8]}"
+
+        logger.info(
+            f"[EXIT_MGR] PARTIAL_TAKE: {symbol} sold {shares_to_sell}/{position.original_shares} shares "
+            f"@ ${current_price:.4f} | P&L=${partial_pnl:+.2f} | "
+            f"remaining={remaining} | trailing now ACTIVE | "
+            f"strategy={position.strategy_name}"
+        )
+
+        # Emit ORDER_SUBMITTED (partial sell)
+        await self._emit(create_event(
+            EventType.ORDER_SUBMITTED,
+            payload={
+                "client_order_id": client_order_id,
+                "symbol": symbol,
+                "side": side,
+                "quantity": shares_to_sell,
+                "order_type": "market",
+                "auto_confirmed": True,
+                "exit_reason": "PARTIAL_TAKE",
+                "position_id": position.position_id,
+                "partial": True,
+            },
+            symbol=symbol,
+            correlation_id=correlation_id,
+        ))
+
+        await asyncio.sleep(0.05)
+
+        # Emit ORDER_FILL_RECEIVED (partial sell)
+        await self._emit(create_event(
+            EventType.ORDER_FILL_RECEIVED,
+            payload={
+                "client_order_id": client_order_id,
+                "symbol": symbol,
+                "side": side,
+                "filled_quantity": shares_to_sell,
+                "fill_price": current_price,
+                "exec_id": f"exec_partial_{uuid.uuid4().hex[:8]}",
+                "auto_confirmed": True,
+                "exit_reason": "PARTIAL_TAKE",
+                "position_id": position.position_id,
+                "partial": True,
+            },
+            symbol=symbol,
+            correlation_id=correlation_id,
+        ))
+
     # ─── Exit Execution ───────────────────────────────────────────────
 
     async def _execute_exit(
@@ -596,23 +828,27 @@ class PaperPositionManager:
         client_order_id = f"exit_{reason.value}_{uuid.uuid4().hex[:8]}"
         correlation_id = f"exit_{position.position_id[:8]}"
 
-        # Compute P&L
+        # Compute P&L (remaining shares only)
         if position.direction == "long":
-            pnl = (exit_price - position.entry_price) * position.shares
+            remaining_pnl = (exit_price - position.entry_price) * position.shares
         else:
-            pnl = (position.entry_price - exit_price) * position.shares
+            remaining_pnl = (position.entry_price - exit_price) * position.shares
 
-        pnl_pct = (pnl / (position.entry_price * position.shares)) * 100 if position.entry_price > 0 else 0.0
+        # Total trade P&L = partial sell P&L + remaining shares P&L
+        total_pnl = remaining_pnl + position.partial_take_pnl
+        total_shares = position.original_shares if position.partial_taken else position.shares
+        pnl_pct = (total_pnl / (position.entry_price * total_shares)) * 100 if position.entry_price > 0 else 0.0
         hold_seconds = (datetime.now(timezone.utc) - position.entry_time).total_seconds()
 
         # Track exit reason counts
         if reason.value in self._exit_counts:
             self._exit_counts[reason.value] += 1
 
+        partial_str = f" (partial P&L=${position.partial_take_pnl:+.2f})" if position.partial_taken else ""
         logger.info(
             f"[EXIT_MGR] {reason.value}: {symbol} "
             f"{position.shares} shares @ ${exit_price:.4f} | "
-            f"entry=${position.entry_price:.4f} P&L=${pnl:+.2f} ({pnl_pct:+.2f}%) | "
+            f"entry=${position.entry_price:.4f} total_P&L=${total_pnl:+.2f} ({pnl_pct:+.2f}%){partial_str} | "
             f"held {hold_seconds:.0f}s/{position.max_hold_seconds:.0f}s max | "
             f"strategy={position.strategy_name}"
         )
@@ -627,8 +863,9 @@ class PaperPositionManager:
                 "exit_price": exit_price,
                 "entry_price": position.entry_price,
                 "shares": position.shares,
+                "original_shares": position.original_shares,
                 "direction": position.direction,
-                "pnl": pnl,
+                "pnl": total_pnl,
                 "pnl_pct": pnl_pct,
                 "hold_time": hold_seconds,
                 "max_hold_seconds": position.max_hold_seconds,
@@ -636,6 +873,8 @@ class PaperPositionManager:
                 "trailing_was_active": position.trailing_active,
                 "high_watermark": position.high_watermark,
                 "hard_stop_price": position.hard_stop_price,
+                "partial_taken": position.partial_taken,
+                "partial_take_pnl": position.partial_take_pnl,
             },
             symbol=symbol,
             correlation_id=correlation_id,
@@ -690,24 +929,32 @@ class PaperPositionManager:
         if not symbol or symbol not in self._positions:
             return
 
+        # PARTIAL SELL: already handled in _execute_partial_take, don't close
+        if payload.get("partial", False):
+            return
+
         position = self._positions[symbol]
         exit_price = payload.get("fill_price", position.last_price)
         exit_reason = payload.get("exit_reason", "unknown")
 
-        # Compute final P&L
+        # Compute final P&L (remaining shares + partial P&L)
         if position.direction == "long":
-            realized_pnl = (exit_price - position.entry_price) * position.shares
+            remaining_pnl = (exit_price - position.entry_price) * position.shares
         else:
-            realized_pnl = (position.entry_price - exit_price) * position.shares
+            remaining_pnl = (position.entry_price - exit_price) * position.shares
 
+        # Total trade P&L includes partial sell P&L
+        realized_pnl = remaining_pnl + position.partial_take_pnl
+
+        total_shares = position.original_shares if position.partial_taken else position.shares
         pnl_pct = (
-            (realized_pnl / (position.entry_price * position.shares)) * 100
+            (realized_pnl / (position.entry_price * total_shares)) * 100
             if position.entry_price > 0 else 0.0
         )
         hold_seconds = (datetime.now(timezone.utc) - position.entry_time).total_seconds()
 
-        # Update daily totals
-        self._daily_realized_pnl += realized_pnl
+        # Update daily totals (partial P&L already counted, only add remaining)
+        self._daily_realized_pnl += remaining_pnl
         self._trade_count += 1
         if realized_pnl > 0:
             self._win_count += 1
@@ -717,7 +964,7 @@ class PaperPositionManager:
             "position_id": position.position_id,
             "symbol": symbol,
             "direction": position.direction,
-            "shares": position.shares,
+            "shares": position.original_shares,
             "entry_price": position.entry_price,
             "exit_price": exit_price,
             "realized_pnl": realized_pnl,
@@ -730,6 +977,8 @@ class PaperPositionManager:
             "regime_at_entry": position.regime_at_entry,
             "entry_time": position.entry_time.isoformat(),
             "exit_time": datetime.now(timezone.utc).isoformat(),
+            "partial_taken": position.partial_taken,
+            "partial_take_pnl": position.partial_take_pnl,
         }
         self._closed_positions.append(closed_record)
 
@@ -741,6 +990,25 @@ class PaperPositionManager:
             f"reason={exit_reason} | Daily: ${self._daily_realized_pnl:+.2f} "
             f"trades={self._trade_count} wins={self._win_count}"
         )
+
+        # ═══════════════════════════════════════════════════════════════════
+        # VALIDATION MODE: Log exit verification for microstructure analysis
+        # ═══════════════════════════════════════════════════════════════════
+        if is_validation_mode():
+            val_logger = get_validation_logger()
+            if val_logger:
+                val_logger.log_exit_verification(
+                    symbol=symbol,
+                    exit_reason=exit_reason,
+                    ssr_active_at_entry=position.ssr_active_at_entry,
+                    htb_at_entry=position.htb_at_entry,
+                    halt_related=exit_reason in {
+                        "HALT_EXIT", "POST_HALT_FAILURE", ExitReason.HALT_EXIT.value,
+                        ExitReason.POST_HALT_FAILURE.value,
+                    },
+                    hold_time_seconds=hold_seconds,
+                    profit=realized_pnl,
+                )
 
         # Emit TRADE_CLOSED event
         await self._emit(create_event(
@@ -839,6 +1107,10 @@ class PaperPositionManager:
                 "time_remaining_seconds": time_remaining,
                 "strategy_name": pos.strategy_name,
                 "entry_time": pos.entry_time.isoformat(),
+                # Partial take state
+                "partial_taken": pos.partial_taken,
+                "original_shares": pos.original_shares,
+                "partial_take_pnl": round(pos.partial_take_pnl, 2),
             })
         return result
 

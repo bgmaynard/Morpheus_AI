@@ -33,13 +33,18 @@ class ScannerRow:
     tags: list[str] = field(default_factory=list)
     velocity_1m: Optional[float] = None
     rvol_proxy: Optional[float] = None
+    rvol_5m: Optional[float] = None  # 5-minute RVOL for velocity detection
     hod_distance_pct: Optional[float] = None
     spread: Optional[float] = None
     float_shares: Optional[float] = None
+    avg_volume: Optional[int] = None
+    short_pct: Optional[float] = None  # Short interest percentage
     market_cap: Optional[float] = None
     gap_pct: Optional[float] = None
     prev_close: Optional[float] = None
     halt_status: Optional[str] = None
+    halt_ts: Optional[str] = None  # Halt timestamp
+    news_present: bool = False  # Has news/catalyst
     bid: Optional[float] = None
     ask: Optional[float] = None
     high: Optional[float] = None
@@ -66,21 +71,29 @@ class ScannerRow:
             "lastPrice": self.price,
             "netPercentChangeInDouble": self.change_pct,
             "totalVolume": self.volume,
-            "averageVolume": avg_volume,
+            "averageVolume": self.avg_volume or avg_volume,
             "bidPrice": self.bid or self.price * 0.999,
             "askPrice": self.ask or self.price * 1.001,
             "highPrice": self.high or self.price,
             "lowPrice": self.low or self.price * 0.95,
             # Additional fields from MAX_AI_SCANNER
-            "ai_score": self.ai_score,
+            # Normalize score to 0-100 scale (MAX_AI returns 0-1)
+            "ai_score": self.ai_score * 100 if self.ai_score <= 1.0 else self.ai_score,
+            "scanner_score": self.ai_score * 100 if self.ai_score <= 1.0 else self.ai_score,
             "rvol": rvol,
+            "rvol_proxy": rvol,  # Alias for consistency
+            "rvol_5m": self.rvol_5m or self.velocity_1m,  # 5-min RVOL for velocity detection
             "velocity_1m": self.velocity_1m,
             "hod_distance_pct": self.hod_distance_pct,
             "tags": self.tags,
             "halt_status": self.halt_status,
+            "halt_ts": self.halt_ts,
             "float_shares": self.float_shares,
+            "avg_volume": self.avg_volume or avg_volume,
+            "short_pct": self.short_pct,
             "market_cap": self.market_cap,
             "gap_pct": self.gap_pct,
+            "news_present": self.news_present,
             # Source marker
             "_source": "MAX_AI_SCANNER",
         }
@@ -210,20 +223,25 @@ class MaxAIScannerClient:
                 row = ScannerRow(
                     rank=row_data.get("rank", 0),
                     symbol=row_data.get("symbol", ""),
-                    price=row_data.get("price", 0.0),
+                    price=row_data.get("price", 0.0) or row_data.get("last_price", 0.0),
                     change_pct=row_data.get("change_pct", 0.0),
                     volume=row_data.get("volume", 0),
                     ai_score=row_data.get("ai_score", 0.0),
                     tags=row_data.get("tags", []),
-                    velocity_1m=row_data.get("velocity_1m"),
-                    rvol_proxy=row_data.get("rvol_proxy"),
-                    hod_distance_pct=row_data.get("hod_distance_pct"),
+                    velocity_1m=row_data.get("velocity_1m") or row_data.get("velocity"),
+                    rvol_proxy=row_data.get("rvol_proxy") or row_data.get("rvol"),
+                    rvol_5m=row_data.get("rvol_5m"),  # 5-min RVOL
+                    hod_distance_pct=row_data.get("hod_distance_pct") or row_data.get("hod_proximity"),
                     spread=row_data.get("spread"),
-                    float_shares=row_data.get("float_shares"),
-                    market_cap=row_data.get("market_cap"),
+                    float_shares=row_data.get("float_shares") or row_data.get("float"),
+                    avg_volume=row_data.get("avg_volume") or row_data.get("averageVolume"),
+                    short_pct=row_data.get("short_pct") or row_data.get("short_percent") or row_data.get("shortInterest") or row_data.get("short_interest"),
+                    market_cap=row_data.get("market_cap") or row_data.get("marketCap"),
                     gap_pct=row_data.get("gap_pct"),
                     prev_close=row_data.get("prev_close"),
                     halt_status=row_data.get("halt_status"),
+                    halt_ts=row_data.get("halt_ts") or row_data.get("halt_time"),
+                    news_present=bool(row_data.get("news_present") or row_data.get("has_news")),
                     bid=row_data.get("bid"),
                     ask=row_data.get("ask"),
                     high=row_data.get("high"),

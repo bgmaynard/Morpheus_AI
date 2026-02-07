@@ -93,6 +93,10 @@ class EventType(str, Enum):
     FEEDBACK_UPDATE = "FEEDBACK_UPDATE"
     STRATEGY_WEIGHT_ADJUSTED = "STRATEGY_WEIGHT_ADJUSTED"
 
+    # Market Phase Events
+    MARKET_PHASE_CHANGE = "MARKET_PHASE_CHANGE"      # Phase transition (PREMARKET -> RTH)
+    STRATEGY_PHASE_ALLOWED = "STRATEGY_PHASE_ALLOWED"  # Strategy allowed in current phase
+
     # Worklist Events (Symbol Intake Pipeline)
     WORKLIST_REJECTED = "WORKLIST_REJECTED"      # Symbol failed scrutiny
     WORKLIST_ADDED = "WORKLIST_ADDED"            # New symbol added to worklist
@@ -101,6 +105,14 @@ class EventType(str, Enum):
     WORKLIST_SELECTED = "WORKLIST_SELECTED"      # Symbol selected for trading
     WORKLIST_TRADED = "WORKLIST_TRADED"          # Symbol was traded
     WORKLIST_RESET = "WORKLIST_RESET"            # Session reset performed
+
+    # Microstructure Status Events
+    SYMBOL_STATUS_UPDATE = "SYMBOL_STATUS_UPDATE"  # Halt/borrow/SSR status change
+    DATA_STALE = "DATA_STALE"                      # Symbol data is stale
+    GATE_DECISION = "GATE_DECISION"                # Microstructure gate decision
+
+    # Exit Profile Events
+    EXIT_PROFILE_APPLIED = "EXIT_PROFILE_APPLIED"  # Strategy-specific exit profile set at entry
 
 
 class Event(BaseModel):

@@ -16,8 +16,9 @@ OFFHOURS: Outside trading windows
 - No actionable signals
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time
+from enum import Enum
 from zoneinfo import ZoneInfo
 
 # Eastern Time zone - canonical for US markets
@@ -46,8 +47,86 @@ class MarketMode:
 
 # Pre-defined market modes
 PREMARKET = MarketMode(name="PREMARKET", active_trading=True, observe_only=False)
-RTH = MarketMode(name="RTH", active_trading=False, observe_only=True)  # Observe-only for now
+RTH = MarketMode(name="RTH", active_trading=True, observe_only=False)  # Paper trading enabled
 OFFHOURS = MarketMode(name="OFFHOURS", active_trading=False, observe_only=True)
+
+
+class MarketPhase(str, Enum):
+    """Market phase determines which regime rules apply."""
+    PREMARKET = "PREMARKET"
+    RTH = "RTH"
+    AFTER_HOURS = "AFTER_HOURS"
+
+
+@dataclass(frozen=True)
+class PhaseRegime:
+    """Phase-specific regime that replaces RTH regime during non-RTH phases."""
+    phase: MarketPhase
+    allowed_strategies: tuple[str, ...]
+    max_positions: int
+    rationale: str
+
+    def to_dict(self) -> dict:
+        return {
+            "phase": self.phase.value,
+            "allowed_strategies": list(self.allowed_strategies),
+            "max_positions": self.max_positions,
+            "rationale": self.rationale,
+        }
+
+
+# Phase-specific regimes (these override RTH regime computation)
+PREMARKET_NORMAL = PhaseRegime(
+    phase=MarketPhase.PREMARKET,
+    allowed_strategies=(
+        "premarket_breakout",
+        "catalyst_momentum",
+        "first_pullback",
+    ),
+    max_positions=1,
+    rationale="PREMARKET_NORMAL: conservative premarket, ignores RTH regime",
+)
+
+AFTER_HOURS_OBSERVE = PhaseRegime(
+    phase=MarketPhase.AFTER_HOURS,
+    allowed_strategies=(),
+    max_positions=0,
+    rationale="AFTER_HOURS_OBSERVE: no trading outside market hours",
+)
+
+
+def get_market_phase(now: datetime | None = None) -> MarketPhase:
+    """
+    Determine the current market phase from the clock.
+
+    Returns:
+        MarketPhase enum value
+    """
+    mode = get_market_mode(now)
+    if mode.name == "PREMARKET":
+        return MarketPhase.PREMARKET
+    elif mode.name == "RTH":
+        return MarketPhase.RTH
+    else:
+        return MarketPhase.AFTER_HOURS
+
+
+def get_phase_regime(phase: MarketPhase | None = None) -> PhaseRegime | None:
+    """
+    Get the phase-specific regime for non-RTH phases.
+
+    Returns:
+        PhaseRegime for PREMARKET/AFTER_HOURS, None for RTH (use computed regime)
+    """
+    if phase is None:
+        phase = get_market_phase()
+
+    if phase == MarketPhase.PREMARKET:
+        return PREMARKET_NORMAL
+    elif phase == MarketPhase.AFTER_HOURS:
+        return AFTER_HOURS_OBSERVE
+    else:
+        return None  # RTH uses computed regime
 
 
 def get_market_mode(now: datetime | None = None) -> MarketMode:

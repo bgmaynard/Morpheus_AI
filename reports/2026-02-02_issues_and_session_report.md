@@ -213,6 +213,198 @@ Max_UI authentication code is broken - needs repair as part of tonight's auth fi
 
 ---
 
+## ISSUE 6: Max_AI Scanner Missing Dynamic Discovery
+
+Max_AI is scanning a **static 185-symbol universe** of large/mid caps, not doing dynamic discovery of today's actual top movers.
+
+**Problem:**
+- FATN is the highest % change stock on Finviz premarket but Max_AI doesn't see it
+- Max_AI universe is hardcoded: WULF, HOOD, FCEL, GME, PLTR, NVDA, etc. (185 symbols)
+- No dynamic discovery from sources like Finviz top gainers
+- Scanner logs show no activity since 2026-02-02 21:27 (may be frozen)
+
+**Impact:**
+- Morpheus_AI only gets symbols from Max_AI scanner
+- Missing obvious plays = missed trading opportunities
+- System not truly scanning the market, just watching a preset list
+
+**Fix Needed:**
+- Add dynamic source: Finviz screener for top % gainers, volume surges
+- Or integrate with TradingView/other scanner APIs
+- Universe should be rebuilt daily based on actual market activity
+
+---
+
+## ISSUE 7: Claude AI Time Reference Confusion
+
+Claude AI has no real-time clock and frequently misinterprets timestamps, leading to incorrect time references during conversations.
+
+**Problem:**
+- Claude sees UTC timestamps in logs (e.g., `09:16:13`) and misinterprets them as local or ET time
+- Claude's internal clock defaults cause confusion (showed 3:17 ET when it was actually 6:17 AM ET)
+- User is in CST (UTC-6), ET is UTC-5, and log timestamps are UTC - Claude mixes these up
+- Results in incorrect statements about "time until premarket" and other time-sensitive guidance
+
+**Workaround:**
+- Always explicitly state timezone with times (e.g., "6:17 AM ET" not just "6:17")
+- Use `get_time_et()` from market_mode.py for authoritative ET time
+- Don't trust Claude's time math - verify against system clock or API response
+
+**Potential Fix:**
+- Add a `/api/system/time` endpoint that returns current time in all relevant timezones
+- Include current ET time in pipeline status response
+- Claude should always fetch time from API rather than inferring from logs
+
+---
+
+## ISSUE 8: Bad Quote Data Causing Incorrect Fill Prices (2026-02-03 CRITICAL)
+
+**Problem:**
+- CYN trade executed with entry price $4.43 when actual price was ~$2.03
+- System immediately hit hard_stop (price below $3.76) and sold at $1.99
+- Paper loss of -$3,416 (-55.1%) in 6 seconds due to bad data
+
+**Evidence:**
+```
+12:38:03 BUY 1400 @ $4.43 (stop=$3.76)
+12:38:09 HARD STOP - sold @ $1.99
+CYN actual price: $2.03-$2.06 all morning
+```
+
+**Root Cause:**
+- Likely caused by server reboot during active trading
+- Stale/cached quote data used after restart
+- $4.43 may have been from historical warmup data, not live price
+- No sanity check on fill price vs recent quotes
+
+**Fix Needed:**
+- Add price sanity check before fills (compare to recent quote range)
+- Investigate quote data source for spikes/bad data
+- Consider using bid/ask midpoint instead of last price for paper fills
+
+---
+
+## ISSUE 9: MAX_AI Scanner Returns 0 Movers (2026-02-03)
+
+**Problem:**
+- MAX_AI scanner API returns 0 movers for all profiles (FAST_MOVERS, TOP_GAINERS, GAPPERS)
+- Scanner integration logs: `[MAX_AI] Fetched 0 movers from FAST_MOVERS profile`
+- Morpheus enters IDLE mode with no symbols to trade
+
+**Root Cause:**
+- Issue 6 (static 185-symbol universe) means Max_AI never discovers new movers
+- Scanner may need restart or the static universe contains no current movers
+
+**Fix for Tonight:**
+- Manual workaround: Use `/api/scanner/force-add/{symbol}` to add symbols directly
+- Permanent fix: Issue 6 - add dynamic discovery from Finviz/other sources
+
+---
+
+## ISSUE 9: Account State Position Count Mismatch
+
+**Problem:**
+- Paper position manager shows 0 positions
+- AccountState shows 3 positions (from Schwab account)
+- MASS Risk Governor vetoes new trades due to regime position limit
+- Account pulling real Schwab positions instead of paper position manager state
+
+**Evidence:**
+```
+Paper positions: []
+Account snapshot open_position_count: 3
+Veto: "Regime CHOP limits to 2 positions, currently 3"
+```
+
+**Fix Needed:**
+- Ensure AccountState uses paper position manager when in PAPER mode
+- Or add endpoint to close/clear old paper positions from Schwab
+- Add `/api/mass/regime/override` endpoint to manually set regime mode
+
+---
+
+## ISSUE 10: Risk Management % Configuration Needs Review (2026-02-03)
+
+**Problem:**
+- Per-trade risk percentage may not be optimal for small-cap momentum trading
+- Current MASS risk settings: 0.25% per trade, 1.5% daily loss limit
+- Need to evaluate if these are appropriate for the strategy and account size
+
+**Current Settings (mass_risk_governor.py):**
+```python
+per_trade_risk_pct: 0.25%  # $250 risk on $100K account
+daily_loss_limit_pct: 1.5%  # $1,500 max daily loss
+symbol_cooldown_seconds: 900  # 15 min between trades on same symbol
+```
+
+**Discussion Points:**
+- Is 0.25% too conservative for momentum scalps that rely on small quick moves?
+- Should per-trade risk scale with signal confidence or structure grade?
+- Should different strategies have different risk %? (SCALP vs D2 vs CAT)
+- Account for stop distance in position sizing (tighter stops = larger size)
+
+**Fix Needed:**
+- Review risk % against actual trade outcomes from today's session
+- Consider dynamic risk sizing based on:
+  - ATR-based stop distance
+  - Strategy type (scalp vs swing)
+  - Structure grade (A vs B)
+  - Regime (HOT vs CHOP)
+
+---
+
+## ISSUE 11: Paper vs Real Position Separation (2026-02-03 CRITICAL)
+
+**Problem:**
+Paper trading is blocked because real Schwab/TOS positions count toward all risk limits:
+- Position count limits (5 real positions = no new paper trades)
+- Daily P&L limits (real account P&L triggers max_daily_loss veto)
+- Exposure limits (real exposure blocks new paper trades)
+
+**Evidence:**
+```
+Veto: "Regime CHOP limits to 10 positions, currently 10"
+Account: open_position_count=10, total_exposure=$65,217
+```
+These are all REAL TOS positions, not paper trades.
+
+**Root Cause:**
+- AccountState pulls from Schwab API (real positions)
+- MASS risk governor checks account.open_position_count against limits
+- No distinction between paper mode and real mode in position counting
+
+**Impact:**
+- Cannot validate paper trading system while holding real positions
+- All signals get vetoed even with valid setups
+
+**Fix Options:**
+1. **Separate Paper AccountState** - When in PAPER mode, use paper_position_manager for position count/exposure instead of Schwab API
+2. **Paper Position Offset** - Subtract real positions from limits (e.g., 10 real + 5 paper = check against 15)
+3. **Mode-Aware Risk Check** - Skip position count check entirely in PAPER mode
+
+---
+
+## ISSUE 12: P&L Percentage Calculation Bug (2026-02-03)
+
+**Problem:**
+Risk manager displays incorrect P&L percentages (off by 100x):
+- Shows: "Daily P&L -727.41% exceeds -50.00% limit"
+- Actual: daily_pnl=-$7,274 = -7.27% (not 727%)
+
+**Root Cause (risk_manager.py):**
+```python
+# Line 156 uses .2% format on a value already in percentage
+f"Daily P&L {account.daily_pnl_pct:.2%} exceeds..."
+```
+The `.2%` format multiplies by 100, but `daily_pnl_pct` is already stored as a percentage value (7.27 not 0.0727).
+
+**Fix:**
+Either:
+1. Store pnl_pct as decimal (0.0727) and use `.2%` format, OR
+2. Store as percentage (7.27) and use `.2f%` format
+
+---
+
 ## Cross-Bot Fix Coordination (Tonight)
 
 ### Morpheus_AI Issues
