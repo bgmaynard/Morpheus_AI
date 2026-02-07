@@ -114,6 +114,14 @@ class EventType(str, Enum):
     # Exit Profile Events
     EXIT_PROFILE_APPLIED = "EXIT_PROFILE_APPLIED"  # Strategy-specific exit profile set at entry
 
+    # Momentum Intelligence Events
+    MOMENTUM_STATE_CHANGE = "MOMENTUM_STATE_CHANGE"  # Momentum state transition
+    MOMENTUM_SNAPSHOT = "MOMENTUM_SNAPSHOT"            # Periodic momentum data broadcast
+
+    # Ignition Gate Events
+    IGNITION_APPROVED = "IGNITION_APPROVED"  # Signal passed all momentum threshold checks
+    IGNITION_REJECTED = "IGNITION_REJECTED"  # Signal failed one or more momentum checks
+
 
 class Event(BaseModel):
     """

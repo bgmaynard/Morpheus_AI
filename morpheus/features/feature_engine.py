@@ -163,6 +163,40 @@ def update_feature_context_with_structure(
     )
 
 
+def update_feature_context_with_momentum(
+    context: FeatureContext,
+    momentum_score: float,
+    momentum_state: str,
+    momentum_confidence: float,
+    nofi: float = 0.0,
+    l2_pressure: float = 0.0,
+    velocity: float = 0.0,
+    absorption: float = 0.0,
+    spread_dynamics: float = 0.0,
+) -> FeatureContext:
+    """
+    Create a new FeatureContext with momentum engine data merged into features.
+
+    Since FeatureContext is frozen, this creates a new instance via replace().
+    Momentum metrics are added to the features dict with 'momentum_engine_' prefix.
+    """
+    from dataclasses import replace
+
+    merged_features = {
+        **context.features,
+        "momentum_engine_score": momentum_score,
+        "momentum_engine_state_str": momentum_state,
+        "momentum_engine_confidence": momentum_confidence,
+        "momentum_nofi": nofi,
+        "momentum_l2_pressure": l2_pressure,
+        "momentum_velocity": velocity,
+        "momentum_absorption": absorption,
+        "momentum_spread_dynamics": spread_dynamics,
+    }
+
+    return replace(context, features=merged_features)
+
+
 def candle_to_ohlcv(candle: Candle) -> OHLCV:
     """Convert a Candle to OHLCV for indicator calculations."""
     return OHLCV(

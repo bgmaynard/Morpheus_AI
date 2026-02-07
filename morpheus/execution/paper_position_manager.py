@@ -240,6 +240,15 @@ class PaperPosition:
     last_new_high_ts: float = 0.0        # For SSR time-based failsafe
     consecutive_rejections: int = 0      # For SSR uptick exhaustion
 
+    # ── Momentum Intelligence ───────────────────────────────────────────
+    entry_momentum_score: float = 0.0       # Momentum composite score at entry (0-100)
+    entry_momentum_state: str = "UNKNOWN"   # Momentum state at entry (BUILDING/PEAKED/etc.)
+    entry_confidence: float = 0.0           # AI confidence at entry (0-1)
+    exit_momentum_state: str = ""           # Momentum state at exit (filled on close)
+    avg_slippage: float = 0.0              # Entry slippage in basis points
+    execution_latency_ms: float = 0.0      # Signal-to-fill latency in ms
+    override_flag: bool = False            # Human override applied
+
     def __post_init__(self):
         from datetime import timedelta
         if self.high_watermark == 0.0:
@@ -517,6 +526,29 @@ class PaperPositionManager:
         htb_at_entry = meta.get("htb_at_entry", False)
         disable_trailing = meta.get("disable_trailing", False)
 
+        # Momentum intelligence from pipeline
+        entry_momentum_score = meta.get("entry_momentum_score", 0.0)
+        entry_momentum_state = meta.get("entry_momentum_state", "UNKNOWN")
+        entry_confidence = meta.get("entry_confidence", 0.0)
+        override_flag = meta.get("override_flag", False)
+
+        # Compute slippage: (fill_price - expected_entry) / expected_entry * 10000 (bps)
+        expected_entry = meta.get("entry_reference", fill_price)
+        avg_slippage = 0.0
+        if expected_entry > 0 and expected_entry != fill_price:
+            avg_slippage = (fill_price - expected_entry) / expected_entry * 10000
+
+        # Compute execution latency if signal timestamp available
+        execution_latency_ms = 0.0
+        signal_ts_str = meta.get("signal_timestamp")
+        if signal_ts_str:
+            try:
+                from datetime import datetime as dt_cls
+                sig_ts = dt_cls.fromisoformat(signal_ts_str) if isinstance(signal_ts_str, str) else signal_ts_str
+                execution_latency_ms = (datetime.now(timezone.utc) - sig_ts).total_seconds() * 1000
+            except Exception:
+                pass
+
         position = PaperPosition(
             position_id=str(uuid.uuid4()),
             symbol=symbol,
@@ -547,6 +579,13 @@ class PaperPositionManager:
             htb_at_entry=htb_at_entry,
             disable_trailing=disable_trailing,
             last_new_high_ts=time.time() if not disable_trailing else 0.0,
+            # Momentum intelligence
+            entry_momentum_score=entry_momentum_score,
+            entry_momentum_state=entry_momentum_state,
+            entry_confidence=entry_confidence,
+            avg_slippage=avg_slippage,
+            execution_latency_ms=execution_latency_ms,
+            override_flag=override_flag,
         )
 
         self._positions[symbol] = position
@@ -875,6 +914,14 @@ class PaperPositionManager:
                 "hard_stop_price": position.hard_stop_price,
                 "partial_taken": position.partial_taken,
                 "partial_take_pnl": position.partial_take_pnl,
+                # Momentum intelligence
+                "entry_momentum_score": position.entry_momentum_score,
+                "entry_momentum_state": position.entry_momentum_state,
+                "entry_confidence": position.entry_confidence,
+                "exit_momentum_state": position.exit_momentum_state,
+                "avg_slippage": position.avg_slippage,
+                "execution_latency_ms": position.execution_latency_ms,
+                "override_flag": position.override_flag,
             },
             symbol=symbol,
             correlation_id=correlation_id,
@@ -979,6 +1026,14 @@ class PaperPositionManager:
             "exit_time": datetime.now(timezone.utc).isoformat(),
             "partial_taken": position.partial_taken,
             "partial_take_pnl": position.partial_take_pnl,
+            # Momentum intelligence
+            "entry_momentum_score": position.entry_momentum_score,
+            "entry_momentum_state": position.entry_momentum_state,
+            "entry_confidence": position.entry_confidence,
+            "exit_momentum_state": position.exit_momentum_state,
+            "avg_slippage": position.avg_slippage,
+            "execution_latency_ms": position.execution_latency_ms,
+            "override_flag": position.override_flag,
         }
         self._closed_positions.append(closed_record)
 

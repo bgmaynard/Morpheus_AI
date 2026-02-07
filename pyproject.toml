@@ -21,6 +21,7 @@ dependencies = [
     "httpx>=0.27.0",
     "nats-py>=2.7.0",
     "msgpack>=1.0.0",
+    "databento>=0.41.0",
 ]
 
 [project.optional-dependencies]

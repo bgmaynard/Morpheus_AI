@@ -210,6 +210,14 @@ class DecisionLogger:
             "market_conditions_at_entry": self._extract_market_conditions(payload),
             # Correlation
             "correlation_id": event.correlation_id,
+            # Momentum intelligence
+            "entry_momentum_score": payload.get("entry_momentum_score", 0.0),
+            "entry_momentum_state": payload.get("entry_momentum_state", "UNKNOWN"),
+            "entry_confidence": payload.get("entry_confidence", 0.0),
+            "exit_momentum_state": payload.get("exit_momentum_state", ""),
+            "avg_slippage": payload.get("avg_slippage", 0.0),
+            "execution_latency_ms": payload.get("execution_latency_ms", 0.0),
+            "override_flag": payload.get("override_flag", False),
         }
 
         self._append_jsonl(day_dir / "trade_ledger.jsonl", record)

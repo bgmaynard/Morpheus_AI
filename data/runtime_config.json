@@ -48,5 +48,24 @@
     "first_pullback": {"enabled": true, "take_pct": 0.50, "trigger_pct": 0.005},
     "short_squeeze": {"enabled": true, "take_pct": 0.50, "trigger_pct": 0.007}
   },
-  "last_reload": ""
+  "runtime_mode": "SHADOW",
+  "shadow_max_trades_per_session": 2,
+  "shadow_max_risk_dollars": 10.0,
+  "micro_max_trades_per_session": 5,
+  "micro_max_risk_dollars": 50.0,
+  "ignition_gate_enabled": true,
+  "ignition_min_momentum_score": 60.0,
+  "ignition_min_nofi": 0.2428,
+  "ignition_min_l2_pressure": 0.5498,
+  "ignition_max_spread_dynamics": 0.0243,
+  "ignition_min_confidence": 0.557,
+  "ignition_rth_open_cooldown_seconds": 120.0,
+  "ignition_daily_loss_limit_pct": 0.02,
+  "last_reload": "",
+  "databento": {
+    "max_cost_per_request": 5.0,
+    "max_daily_spend": 25.0,
+    "default_dataset": "XNAS.ITCH",
+    "cache_dir": ""
+  }
 }

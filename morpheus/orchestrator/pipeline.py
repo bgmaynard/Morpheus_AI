@@ -66,7 +66,10 @@ from morpheus.structure.analyzer import StructureAnalyzer
 from morpheus.structure.types import StructureGrade
 from morpheus.classify.classifier import StrategyClassifier
 from morpheus.classify.types import ClassificationResult
-from morpheus.features.feature_engine import update_feature_context_with_structure
+from morpheus.features.feature_engine import (
+    update_feature_context_with_structure,
+    update_feature_context_with_momentum,
+)
 from morpheus.regime.mass_regime import MASSRegimeMapper, MASSRegime
 from morpheus.risk.mass_risk_governor import MASSRiskGovernor, MASSRiskConfig
 from morpheus.evolve.tracker import PerformanceTracker
@@ -94,6 +97,7 @@ from morpheus.risk.risk_manager import (
 )
 from morpheus.risk.room_to_profit import RoomToProfitConfig
 from morpheus.risk.kill_switch import KillSwitch, KillSwitchResult
+from morpheus.core.runtime_config import get_runtime_config
 
 # Data
 from morpheus.data.market_snapshot import MarketSnapshot
@@ -193,6 +197,7 @@ class SignalPipeline:
         external_context_provider: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
         mass_config: MASSConfig | None = None,
         position_manager: Any = None,
+        momentum_engine: Any = None,
     ):
         """
         Initialize the signal pipeline.
@@ -204,6 +209,7 @@ class SignalPipeline:
                                        (e.g., from MAX_AI_SCANNER for scanner_score, gap_pct, etc.)
             mass_config: MASS configuration (None = use defaults with MASS enabled)
             position_manager: PaperPositionManager for live position tracking (optional)
+            momentum_engine: MomentumEngine for real-time momentum intelligence (optional)
         """
         self.config = config or PipelineConfig()
         self._emit_event = emit_event
@@ -211,6 +217,7 @@ class SignalPipeline:
         self._state = PipelineState()
         self._mass_config = mass_config or MASSConfig()
         self._position_manager = position_manager
+        self._momentum_engine = momentum_engine
 
         # Initialize components
         self._feature_engine = FeatureEngine(
@@ -227,6 +234,14 @@ class SignalPipeline:
 
         # Scorer
         self._scorer = StubScorer()
+
+        # Ignition Gate (hard momentum filter, Stage 5.5)
+        self._ignition_gate = None
+        rc = get_runtime_config()
+        if getattr(rc, 'ignition_gate_enabled', False):
+            from morpheus.scoring.ignition_gate import IgnitionGate, IgnitionGateConfig
+            self._ignition_gate = IgnitionGate(IgnitionGateConfig.from_runtime_config(rc))
+            logger.info("[PIPELINE] Ignition Gate enabled (hard momentum filter)")
 
         # MetaGate (permissive for testing, standard for production)
         if self.config.permissive_mode:
@@ -562,6 +577,29 @@ class SignalPipeline:
                 except Exception as e:
                     logger.warning(f"[PIPELINE] Failed to fetch external context for {symbol}: {e}")
 
+            # Stage 1.7: Augment with momentum engine data (if available)
+            if self._momentum_engine:
+                try:
+                    momentum_snap = self._momentum_engine.get_snapshot(symbol)
+                    if momentum_snap:
+                        feature_context = update_feature_context_with_momentum(
+                            feature_context,
+                            momentum_score=momentum_snap.momentum_score,
+                            momentum_state=momentum_snap.momentum_state.value,
+                            momentum_confidence=momentum_snap.confidence,
+                            nofi=momentum_snap.nofi,
+                            l2_pressure=momentum_snap.l2_pressure,
+                            velocity=momentum_snap.velocity,
+                            absorption=momentum_snap.absorption,
+                            spread_dynamics=momentum_snap.spread_dynamics,
+                        )
+                        logger.debug(
+                            f"[PIPELINE] {symbol} momentum: score={momentum_snap.momentum_score:.1f} "
+                            f"state={momentum_snap.momentum_state.value}"
+                        )
+                except Exception as e:
+                    logger.warning(f"[PIPELINE] Momentum engine error for {symbol}: {e}")
+
             await self._emit(feature_context.to_event())
 
             # Stage 2: Detect regime
@@ -745,6 +783,41 @@ class SignalPipeline:
         if scored_signal.confidence < self.config.min_signal_confidence:
             logger.debug(f"[PIPELINE] {symbol} below min confidence, skipping gate")
             return
+
+        # Stage 5.5: Ignition Gate (hard momentum filter)
+        if self._ignition_gate:
+            daily_pnl_pct = 0.0
+            if self._position_manager:
+                try:
+                    acct = self._position_manager.get_account_state(
+                        base_equity=Decimal(str(self.config.paper_equity)),
+                        kill_switch_active=self._state.kill_switch_active,
+                    )
+                    daily_pnl_pct = float(acct.daily_pnl_pct)
+                except Exception:
+                    pass
+
+            ig_result = self._ignition_gate.evaluate(
+                features=features.features,
+                daily_pnl_pct=daily_pnl_pct,
+            )
+
+            if ig_result.passed:
+                await self._emit(create_event(
+                    EventType.IGNITION_APPROVED,
+                    symbol=symbol,
+                    payload=ig_result.to_event_payload(),
+                ))
+            else:
+                await self._emit(create_event(
+                    EventType.IGNITION_REJECTED,
+                    symbol=symbol,
+                    payload=ig_result.to_event_payload(),
+                ))
+                logger.info(
+                    f"[PIPELINE] Ignition REJECTED: {symbol} - {ig_result.failures}"
+                )
+                return  # Stop processing
 
         # Stage 6: Gate the signal
         gate_result = self._meta_gate.evaluate(scored_signal, features)
@@ -947,4 +1020,7 @@ class SignalPipeline:
             "mass_regime_mapping_enabled": self._mass_config.regime_mapping_enabled,
             "mass_feedback_enabled": self._mass_config.feedback_enabled,
             "mass_supervisor_enabled": self._mass_config.supervisor_enabled,
+            # Shadow mode + Ignition gate
+            "runtime_mode": getattr(get_runtime_config(), 'runtime_mode', 'SHADOW'),
+            "ignition_gate": self._ignition_gate is not None,
         }

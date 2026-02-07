@@ -210,6 +210,28 @@ class StubScorer(Scorer):
                 contributing.append("volatility_penalty")
                 rationale_parts.append(f"High volatility ({atr_pct:.2f}%): -{cfg.high_volatility_penalty:.2f}")
 
+        # Momentum engine bonus/penalty (if available)
+        momentum_score = feat.get("momentum_engine_score")
+        momentum_state = feat.get("momentum_engine_state_str", "")
+        if momentum_score is not None:
+            # Bonus: high momentum aligned with signal direction
+            if momentum_score > 70:
+                nofi = feat.get("momentum_nofi", 0)
+                if (is_long and nofi > 0) or (is_short and nofi < 0):
+                    confidence += 0.10
+                    contributing.append("momentum_aligned")
+                    rationale_parts.append(f"Momentum aligned (score={momentum_score:.0f}): +0.10")
+            # Penalty: decaying momentum for new longs
+            if momentum_state == "DECAYING" and is_long:
+                confidence -= 0.10
+                contributing.append("momentum_decaying_penalty")
+                rationale_parts.append(f"Momentum decaying: -0.10")
+            # Penalty: reversing momentum against direction
+            if momentum_state == "REVERSING":
+                confidence -= 0.05
+                contributing.append("momentum_reversing_penalty")
+                rationale_parts.append(f"Momentum reversing: -0.05")
+
         # Build feature snapshot for audit (include spread for risk evaluation)
         feature_snapshot = {
             "trend_strength": trend_strength,
@@ -217,6 +239,12 @@ class StubScorer(Scorer):
             "relative_volume": relative_vol,
             "macd_histogram": macd_hist,
             "atr_pct": atr_pct,
+            # Momentum intelligence
+            "momentum_engine_score": momentum_score,
+            "momentum_engine_state_str": momentum_state,
+            "momentum_engine_confidence": feat.get("momentum_engine_confidence"),
+            "momentum_nofi": feat.get("momentum_nofi"),
+            "momentum_l2_pressure": feat.get("momentum_l2_pressure"),
         }
 
         # Include spread data from snapshot for room-to-profit analysis

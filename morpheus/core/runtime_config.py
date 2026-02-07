@@ -112,6 +112,23 @@ class RuntimeConfig:
         "short_squeeze":     {"enabled": True, "take_pct": 0.50, "trigger_pct": 0.007},
     })
 
+    # ── Shadow/Scale Mode ────────────────────────────────────────────
+    runtime_mode: str = "SHADOW"            # "SHADOW" | "MICRO" | "LIVE"
+    shadow_max_trades_per_session: int = 2
+    shadow_max_risk_dollars: float = 10.0
+    micro_max_trades_per_session: int = 5
+    micro_max_risk_dollars: float = 50.0
+
+    # ── Ignition Gate Thresholds (from Master Playbook) ──────────────
+    ignition_gate_enabled: bool = True
+    ignition_min_momentum_score: float = 60.0
+    ignition_min_nofi: float = 0.2428
+    ignition_min_l2_pressure: float = 0.5498
+    ignition_max_spread_dynamics: float = 0.0243
+    ignition_min_confidence: float = 0.557
+    ignition_rth_open_cooldown_seconds: float = 120.0
+    ignition_daily_loss_limit_pct: float = 0.02
+
     # Last update timestamp
     last_reload: str = ""
 

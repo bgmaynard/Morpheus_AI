@@ -1,1 +1,1 @@
-"""AI modules: signal scoring and meta gate."""
+"""AI modules: signal scoring, meta gate, and momentum engine."""

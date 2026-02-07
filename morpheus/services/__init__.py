@@ -1,4 +1,4 @@
-"""Services: scheduler and other runtime components."""
+"""Services: scheduler, Databento client, normalizer, and replay engine."""
 
 from morpheus.services.scheduler import (
     SnapshotScheduler,

@@ -567,6 +567,7 @@ class MorpheusServer:
 
             # Initialize Momentum Engine (optional — additive only)
             self._momentum_engine = None
+            self._live_validation_logger = None
             try:
                 from morpheus.ai.momentum_engine import MomentumEngine
 
@@ -586,6 +587,15 @@ class MorpheusServer:
                 logger.info("[MOMENTUM] Momentum engine initialized")
             except Exception as e:
                 logger.warning(f"[MOMENTUM] Momentum engine not available: {e}")
+
+            # Initialize LiveValidationLogger for shadow/micro mode validation
+            try:
+                from morpheus.reporting.live_validation_logger import LiveValidationLogger
+                self._live_validation_logger = LiveValidationLogger()
+                logger.info("[LIVE_VALIDATION] Validation logger initialized")
+            except Exception as e:
+                self._live_validation_logger = None
+                logger.warning(f"[LIVE_VALIDATION] Logger not available: {e}")
 
             # Create pipeline with emit callback
             self._pipeline = SignalPipeline(
@@ -1833,6 +1843,13 @@ class MorpheusServer:
         except Exception as e:
             logger.error(f"Error in decision logger: {e}")
 
+        # Feed LiveValidationLogger for rolling validation log
+        if self._live_validation_logger:
+            try:
+                self._live_validation_logger.on_event(event)
+            except Exception as e:
+                logger.error(f"[LIVE_VALIDATION] Logger error: {e}")
+
         # Feed PaperPositionManager for position tracking + exit management
         if self._paper_position_manager:
             try:
@@ -1977,6 +1994,57 @@ class MorpheusServer:
                             f"{window_start}-{window_end} (current={current_time})"
                         )
                         return
+
+                # ══════════════════════════════════════════════════════════════
+                # SHADOW/MICRO MODE: Session trade cap + risk dollar cap
+                # ══════════════════════════════════════════════════════════════
+                runtime_cfg = get_runtime_config()
+                runtime_mode = runtime_cfg.runtime_mode.upper()
+                if runtime_mode == "SHADOW":
+                    session_cap = runtime_cfg.shadow_max_trades_per_session
+                    max_risk = runtime_cfg.shadow_max_risk_dollars
+                elif runtime_mode == "MICRO":
+                    session_cap = runtime_cfg.micro_max_trades_per_session
+                    max_risk = runtime_cfg.micro_max_risk_dollars
+                else:
+                    session_cap = 999
+                    max_risk = 99999
+
+                # Count session trades from validation counters
+                total_session = 0
+                if is_validation_mode():
+                    val_counters_check = get_validation_counters()
+                    if val_counters_check:
+                        total_session = sum(val_counters_check.trades_by_phase.values())
+
+                if total_session >= session_cap:
+                    logger.warning(
+                        f"[{runtime_mode}] Session cap reached: {total_session}/{session_cap}"
+                    )
+                    await self.emit_event(create_event(
+                        EventType.EXECUTION_BLOCKED,
+                        payload={
+                            "symbol": symbol,
+                            "block_reasons": [f"{runtime_mode}_SESSION_CAP"],
+                            "mode": runtime_mode,
+                            "session_cap": session_cap,
+                            "session_trades": total_session,
+                        },
+                        symbol=symbol,
+                    ))
+                    return
+
+                # Cap notional per mode
+                notional_check = shares * entry_price
+                if notional_check > max_risk:
+                    original_shares = shares
+                    shares = max(1, int(max_risk / entry_price))
+                    logger.info(
+                        f"[{runtime_mode}] {symbol} size capped: "
+                        f"{original_shares} -> {shares} shares "
+                        f"(${notional_check:.2f} -> ${shares * entry_price:.2f}, "
+                        f"max_risk=${max_risk:.2f})"
+                    )
 
                 # ══════════════════════════════════════════════════════════════
                 # MICROSTRUCTURE GATES: Check halt/borrow/SSR/staleness FIRST
@@ -2222,6 +2290,8 @@ class MorpheusServer:
                             "entry_confidence": entry_confidence_raw,
                             "entry_reference": signal_data.get("entry_reference", entry_price),
                             "signal_timestamp": signal_data.get("timestamp", ""),
+                            # Shadow/Scale mode tag
+                            "trade_tag": get_runtime_config().runtime_mode.upper(),
                         })
 
                         partial_str = f" partial={exit_plan.partial_take_pct:.0%}@{exit_plan.partial_trigger_pct:.1%}" if exit_plan.allow_partial_take else ""
@@ -4073,16 +4143,58 @@ def create_app() -> FastAPI:
                 f.write(md_content)
 
             logger.info(f"[EOD] Report generated: {json_path}")
+
+            # Auto-trigger daily validation review alongside EOD
+            daily_review_path = None
+            try:
+                from morpheus.reporting.daily_review import DailyReviewGenerator
+                reviewer = DailyReviewGenerator(
+                    reports_dir=dl.get_reports_dir(),
+                )
+                review_result = reviewer.generate(target_date)
+                daily_review_path = review_result.get("output_path")
+                logger.info(f"[EOD] Daily validation review generated: {daily_review_path}")
+            except Exception as review_err:
+                logger.warning(f"[EOD] Daily validation review failed: {review_err}")
+
             return {
                 "success": True,
                 "date": date_str,
                 "json_path": str(json_path),
                 "md_path": str(md_path),
+                "daily_review_path": daily_review_path,
                 "report": report,
             }
 
         except Exception as e:
             logger.error(f"EOD report generation failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    @app.post("/api/reports/daily-review")
+    async def generate_daily_review(report_date: str | None = None):
+        """
+        Generate daily validation review for shadow/micro mode.
+
+        Compares live performance to playbook baseline and checks rule compliance.
+        """
+        from morpheus.reporting.daily_review import DailyReviewGenerator
+        from morpheus.reporting.decision_logger import get_decision_logger
+        from datetime import date as date_type
+
+        try:
+            if report_date:
+                target_date = date_type.fromisoformat(report_date)
+            else:
+                target_date = date_type.today()
+
+            dl = get_decision_logger()
+            reviewer = DailyReviewGenerator(
+                reports_dir=dl.get_reports_dir(),
+            )
+            result = reviewer.generate(target_date)
+            return {"success": True, "review": result}
+        except Exception as e:
+            logger.error(f"Daily review generation failed: {e}")
             return {"success": False, "error": str(e)}
 
     @app.get("/api/reports/eod/{report_date}")
@@ -4128,6 +4240,28 @@ def create_app() -> FastAPI:
 
         records = _read_jsonl(file_path)
         return {"date": report_date, "ledger": ledger_type, "records": records, "count": len(records)}
+
+    @app.post("/api/reports/scale-readiness")
+    async def generate_scale_readiness(min_sessions: int = 5):
+        """
+        Generate multi-session Go/No-Go scale readiness report.
+
+        Evaluates win rate, profit factor, drawdown, discipline, and sample size
+        across recent trading sessions to recommend SHADOW -> MICRO scaling.
+        """
+        from morpheus.reporting.scale_readiness import ScaleReadinessReport
+        from morpheus.reporting.decision_logger import get_decision_logger
+
+        try:
+            dl = get_decision_logger()
+            reporter = ScaleReadinessReport(
+                project_reports_dir=dl.get_reports_dir(),
+            )
+            result = reporter.generate(min_sessions=min_sessions)
+            return {"success": True, "readiness": result}
+        except Exception as e:
+            logger.error(f"Scale readiness report failed: {e}")
+            return {"success": False, "error": str(e)}
 
     @app.delete("/api/scanner/remove/{symbol}")
     async def remove_from_watchlist(symbol: str):
