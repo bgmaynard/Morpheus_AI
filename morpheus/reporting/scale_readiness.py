@@ -153,7 +153,7 @@ class ScaleReadinessReport:
         gross_loss = abs(sum(float(t.get("pnl", 0)) for t in losses))
 
         win_rate = len(wins) / len(trades) if trades else 0
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else 999.0
 
         avg_win = gross_profit / len(wins) if wins else 0
         avg_loss = -gross_loss / len(losses) if losses else 0
@@ -281,7 +281,7 @@ class ScaleReadinessReport:
                 f.write(f"| Win Rate | {wr:.1%} | >= 32% | {'PASS' if checks.get('win_rate_ok') else 'FAIL'} |\n")
 
                 pf = metrics.get("profit_factor", 0)
-                pf_str = f"{pf:.2f}" if pf != float("inf") else "INF"
+                pf_str = f"{pf:.2f}" if pf < 999 else "INF"
                 f.write(f"| Profit Factor | {pf_str} | >= 1.5 | {'PASS' if checks.get('profit_factor_ok') else 'FAIL'} |\n")
 
                 dd = metrics.get("max_drawdown_pct", 0)
