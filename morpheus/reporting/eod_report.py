@@ -284,6 +284,21 @@ class EODReport:
             "phase_regime": self.phase_regime_summary,
             "microstructure": self.microstructure_segment.to_dict() if self.microstructure_segment else None,
             "validation": self.validation_summary,
+            # 12-Section Standard placeholders (IBKR parity — to be filled by full port)
+            "sections_standard": {
+                "header": {"status": "partial", "note": "date/bot_id available"},
+                "executive_summary": {"status": "available"},
+                "performance_metrics": {"status": "partial"},
+                "momentum_intelligence": {"status": "not_implemented"},
+                "strategy_analysis": {"status": "partial"},
+                "execution_quality": {"status": "not_implemented"},
+                "risk_management": {"status": "partial"},
+                "variance_intelligence": {"status": "not_implemented"},
+                "system_health": {"status": "not_implemented"},
+                "dev_ops": {"status": "not_implemented"},
+                "action_plan": {"status": "not_implemented"},
+                "cross_bot_comparison": {"status": "not_implemented"},
+            },
         }
 
     def to_markdown(self) -> str:
