@@ -438,3 +438,30 @@ MASSConfig(
 
 **11 total registered strategies:**
 4 original (PremarketStructureObserver, FirstPullback, HODContinuation, VWAPReclaim) + 7 MASS
+
+### Shadow Mode + Ignition Gate + Live Validation (2026-02-07)
+
+**Runtime Modes:** SHADOW (2 trades/$10) → MICRO (5 trades/$50) → LIVE (no caps)
+
+**Ignition Gate (Pipeline Stage 5.5):** 9 fail-closed momentum checks from Playbook:
+- score>=60, nofi>=0.2428, l2>=0.5498, spread<=0.0243, confidence>=0.557
+- RTH cooldown 120s, conflicting signals, declining score (3 drops), daily loss limit 2%
+- No momentum data → REJECT. Gate disabled → pass all.
+
+**Events:** IGNITION_APPROVED, IGNITION_REJECTED
+
+**Reporting:**
+- `LiveValidationLogger`: Rolling monthly markdown+JSONL in `D:/AI_BOT_DATA/logs/`
+- `DailyReviewGenerator`: EOD summary comparing live vs playbook baseline (42.3% WR, +34 bps)
+- `ScaleReadinessReport`: Go/No-Go after 5 sessions (WR>=32%, PF>=1.5, DD<=5%, discipline>=90%)
+
+**API:**
+- `POST /api/reports/daily-review` - Generate daily validation summary
+- `POST /api/reports/scale-readiness` - Generate Go/No-Go report
+- `GET /api/pipeline/status` - Now includes `runtime_mode`, `ignition_gate`
+
+**Key Files:**
+- `morpheus/scoring/ignition_gate.py`
+- `morpheus/reporting/live_validation_logger.py`
+- `morpheus/reporting/daily_review.py`
+- `morpheus/reporting/scale_readiness.py`
