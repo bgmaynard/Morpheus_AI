@@ -90,6 +90,15 @@ class TradeRecord:
     signal_id: str | None = None
     meta_score: float | None = None
 
+    # Momentum + Execution metadata (IBKR parity — populated later)
+    entry_momentum_score: float | None = None
+    entry_momentum_state: str | None = None
+    entry_confidence: float | None = None
+    exit_momentum_state: str | None = None
+    avg_slippage: float | None = None
+    execution_latency_ms: int | None = None
+    override_flag: bool = False
+
     # State history for audit
     state_history: list[tuple[TradeState, datetime]] = field(default_factory=list)
 
@@ -225,6 +234,13 @@ class TradeLifecycleFSM:
             strategy_name=trade.strategy_name,
             signal_id=trade.signal_id,
             meta_score=trade.meta_score,
+            entry_momentum_score=updates.get("entry_momentum_score", trade.entry_momentum_score),
+            entry_momentum_state=updates.get("entry_momentum_state", trade.entry_momentum_state),
+            entry_confidence=updates.get("entry_confidence", trade.entry_confidence),
+            exit_momentum_state=updates.get("exit_momentum_state", trade.exit_momentum_state),
+            avg_slippage=updates.get("avg_slippage", trade.avg_slippage),
+            execution_latency_ms=updates.get("execution_latency_ms", trade.execution_latency_ms),
+            override_flag=updates.get("override_flag", trade.override_flag),
             state_history=trade.state_history + [(new_state, now)],
         )
         self._trades[trade_id] = new_trade
