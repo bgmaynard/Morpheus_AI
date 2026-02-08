@@ -61,6 +61,7 @@
   "ignition_min_confidence": 0.557,
   "ignition_rth_open_cooldown_seconds": 120.0,
   "ignition_daily_loss_limit_pct": 0.02,
+  "eod_template_version": "v1",
   "last_reload": "",
   "databento": {
     "max_cost_per_request": 5.0,

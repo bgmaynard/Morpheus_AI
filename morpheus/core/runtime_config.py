@@ -129,6 +129,9 @@ class RuntimeConfig:
     ignition_rth_open_cooldown_seconds: float = 120.0
     ignition_daily_loss_limit_pct: float = 0.02
 
+    # ── EOD Reporting ─────────────────────────────────────────────
+    eod_template_version: str = "v1"       # "legacy" | "v1"
+
     # Last update timestamp
     last_reload: str = ""
 

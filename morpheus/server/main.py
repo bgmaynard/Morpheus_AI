@@ -4136,13 +4136,68 @@ def create_app() -> FastAPI:
             with open(json_path, "w", encoding="utf-8") as f:
                 json_mod.dump(report, f, indent=2, default=str)
 
-            # Save Markdown
+            # Save Markdown (use template version from runtime config)
             md_path = day_dir / f"eod_{date_str}.md"
-            md_content = _generate_eod_markdown(report)
+            rc = get_runtime_config()
+            template_version = getattr(rc, "eod_template_version", "legacy")
+
+            if template_version == "v1":
+                from morpheus.reporting.templates.eod_v1 import render_report as render_eod_v1
+                report["bot_id"] = "Morpheus_AI"
+                report["runtime_mode"] = getattr(rc, "runtime_mode", "PAPER")
+                md_content = render_eod_v1(report)
+            else:
+                md_content = _generate_eod_markdown(report)
+
             with open(md_path, "w", encoding="utf-8") as f:
                 f.write(md_content)
 
             logger.info(f"[EOD] Report generated: {json_path}")
+
+            # Save normalized v1 JSON export for supervisor variance analysis
+            try:
+                exports_dir = dl.get_reports_dir() / "exports"
+                exports_dir.mkdir(parents=True, exist_ok=True)
+                v1_export_path = exports_dir / f"eod_v1_{date_str}.json"
+
+                # Build gating top veto reasons
+                sorted_reasons = sorted(gating_by_reason.items(), key=lambda x: -x[1])
+                top_veto = [[r, c] for r, c in sorted_reasons[:5]]
+
+                v1_export = {
+                    "date": date_str,
+                    "bot": "morpheus",
+                    "mode": getattr(rc, "runtime_mode", "PAPER"),
+                    "symbols_tracked": len(all_symbols),
+                    "signals_detected": len(signal_candidates),
+                    "signals_rejected": len(rejected_from_signals) + len(blocks),
+                    "trades_auto": len(closed_trades),
+                    "trades_manual": 0,
+                    "pnl_total": round(total_pnl, 2),
+                    "win_rate": round(win_rate * 100, 1),
+                    "profit_factor": round(profit_factor, 2) if profit_factor != float("inf") else 999.99,
+                    "avg_r": 0.0,
+                    "gating": {
+                        "approved": len(approved_signals),
+                        "vetoed": len(blocks),
+                        "top_veto_reasons": top_veto,
+                    },
+                    "execution": {
+                        "avg_slippage_bps": 0.0,
+                        "rejected_orders": 0,
+                    },
+                    "system": {
+                        "startup_ok": True,
+                        "data_gaps": 0,
+                        "exceptions": 0,
+                    },
+                }
+
+                with open(v1_export_path, "w", encoding="utf-8") as f:
+                    json_mod.dump(v1_export, f, indent=2)
+                logger.info(f"[EOD] v1 export written: {v1_export_path}")
+            except Exception as v1_err:
+                logger.warning(f"[EOD] v1 export failed: {v1_err}")
 
             # Auto-trigger daily validation review alongside EOD
             daily_review_path = None

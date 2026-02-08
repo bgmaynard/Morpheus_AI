@@ -465,3 +465,14 @@ MASSConfig(
 - `morpheus/reporting/live_validation_logger.py`
 - `morpheus/reporting/daily_review.py`
 - `morpheus/reporting/scale_readiness.py`
+
+### EOD Report Template v1 (2026-02-07)
+- `eod_template_version` field in runtime_config.json: `"legacy"` or `"v1"`
+- v1 template: `morpheus/reporting/templates/eod_v1.py`
+- Normalized JSON export: `reports/exports/eod_v1_{date}.json` for supervisor variance analysis
+
+### AI Supervisor Control API (2026-02-07)
+- **Control API**: `C:\AI_SUPERVISOR\api\control.py` on port 9001
+- **Dashboard**: Voice + buttons at `GET /`, works local + remote via ngrok tunnel
+- **Safe Boot**: `C:\AI_SUPERVISOR\scripts\safe_start.ps1` — one command starts all bots in order
+  - Morpheus (AI+UI) → OAuth verify → Max_AI scanner → Supervisor + API + tunnel
